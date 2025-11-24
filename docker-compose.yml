@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  economic-cron:
+    build: .
+    container_name: projeto-risco-cron
+    volumes:
+      - ./data:/app/data
+      - ./logs:/var/log
+    environment:
+      - PYTHONPATH=/app
+    restart: unless-stopped
+
+  # Mudei para Streamlit (baseado no seu requirements.txt)
+  dashboard:
+    build: .
+    container_name: projeto-risco-dashboard
+    command: streamlit run dashboard/app.py --server.port=8501 --server.address=0.0.0.0
+    ports:
+      - "8501:8501"  # Porta do Streamlit
+    volumes:
+      - ./data:/app/data
+      - ./dashboard:/app/dashboard
+    environment:
+      - PYTHONPATH=/app
+    depends_on:
+      - economic-cron
+    restart: unless-stopped

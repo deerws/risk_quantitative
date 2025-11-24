@@ -1,0 +1,22 @@
+{
+  "JUROS": [
+    "SELIC",
+    "CDI"
+  ],
+  "INFLACAO": [
+    "IPCA",
+    "IGPM"
+  ],
+  "CAMBIO": [
+    "USD_BRL",
+    "EUR_BRL"
+  ],
+  "COMMODITIES": [
+    "PETROLEO_BRENT"
+  ],
+  "ECONOMIA_REAL": [
+    "PIB_MENSAL",
+    "INDUSTRIA",
+    "RESERVAS_INTERNACIONAIS"
+  ]
+}

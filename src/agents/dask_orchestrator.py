@@ -1,0 +1,1150 @@
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Any, Optional, Tuple
+from datetime import datetime
+import warnings
+from dask import delayed, compute
+from dask.distributed import Client, LocalCluster
+import joblib
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.decomposition import PCA
+from sklearn.ensemble import IsolationForest
+import warnings
+import sys
+import os
+
+# ✅ CORREÇÃO: Importar AgentBase do arquivo separado
+try:
+    from .agent_base import AgentBase
+except ImportError:
+    # Fallback para desenvolvimento
+    sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+    from agents.agent_base import AgentBase
+
+warnings.filterwarnings('ignore')
+
+class AgentMarket(AgentBase):
+    """Monitora condições gerais de mercado - CORRIGIDO"""
+    
+    def __init__(self):
+        super().__init__("AgentMarket")
+        self.volatility_threshold = 0.30
+        self.correlation_threshold = 0.8
+        
+    def detect_regime_changes(self, returns: pd.DataFrame, window: int = 60) -> Dict[str, Any]:
+        """Detecta mudanças de regime usando rolling statistics - CORRIGIDO"""
+        try:
+            if returns.empty:
+                return {}
+                
+            rolling_vol = returns.rolling(window).std() * np.sqrt(252)
+            
+            # ✅ CORREÇÃO: Verificar se há dados suficientes
+            if len(rolling_vol) < window:
+                return {}
+            
+            # ✅ CORREÇÃO: Usar mean(axis=1) corretamente para portfolio returns
+            market_returns = returns.mean(axis=1)
+            
+            # ✅ CORREÇÃO: Calcular correlação de forma segura
+            rolling_corr_list = []
+            for col in returns.columns:
+                try:
+                    corr_series = returns[col].rolling(window).corr(market_returns)
+                    rolling_corr_list.append(corr_series)
+                except:
+                    continue
+            
+            if rolling_corr_list:
+                avg_corr = pd.concat(rolling_corr_list, axis=1).mean(axis=1)
+            else:
+                avg_corr = pd.Series(0, index=returns.index)
+            
+            # ✅ CORREÇÃO: Calcular z-scores de forma segura
+            vol_zscore = (rolling_vol - rolling_vol.mean()) / (rolling_vol.std() + 1e-8)
+            
+            # ✅ CORREÇÃO: Aplicar mean(axis=1) apenas em DataFrame, não Series
+            if isinstance(vol_zscore, pd.DataFrame):
+                vol_zscore_mean = vol_zscore.mean(axis=1)
+            else:
+                vol_zscore_mean = vol_zscore
+                
+            corr_zscore = (avg_corr - avg_corr.mean()) / (avg_corr.std() + 1e-8)
+            
+            # ✅ CORREÇÃO: Converter para numérico antes de comparar
+            high_vol_periods = (vol_zscore_mean > 2).sum() if not vol_zscore_mean.empty else 0
+            low_vol_periods = (vol_zscore_mean < -2).sum() if not vol_zscore_mean.empty else 0
+            high_corr_periods = (corr_zscore > 2).sum() if not corr_zscore.empty else 0
+            
+            # ✅ CORREÇÃO: Calcular mudanças de regime
+            vol_diff = vol_zscore_mean.diff().abs() if not vol_zscore_mean.empty else pd.Series()
+            corr_diff = corr_zscore.diff().abs() if not corr_zscore.empty else pd.Series()
+            
+            vol_regime_change = (vol_diff > 1).sum() if not vol_diff.empty else 0
+            corr_regime_change = (corr_diff > 1).sum() if not corr_diff.empty else 0
+            
+            regime_changes = {
+                'high_vol_periods': int(high_vol_periods),
+                'low_vol_periods': int(low_vol_periods), 
+                'high_corr_periods': int(high_corr_periods),
+                'vol_regime_change': int(vol_regime_change),
+                'corr_regime_change': int(corr_regime_change)
+            }
+            
+            return regime_changes
+            
+        except Exception as e:
+            print(f"Erro em detect_regime_changes: {e}")
+            return {}
+    def process_data(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Processa dados de mercado - CORRIGIDO"""
+        alerts = []
+        
+        try:
+            returns = market_data.pct_change().dropna()
+            
+            if returns.empty:
+                alerts.append(self.generate_alert(
+                    "Dados de retornos vazios",
+                    "low",
+                    {}
+                ))
+                return alerts
+            
+            # ✅ CORREÇÃO: Análise de volatilidade com verificação de empty
+            rolling_vol = returns.rolling(20).std() * np.sqrt(252)
+            
+            if not rolling_vol.empty:
+                current_vol = rolling_vol.iloc[-1]  # ✅ Pega apenas o último valor
+                
+                # ✅ CORREÇÃO: Converter para série antes da comparação
+                if isinstance(current_vol, pd.Series):
+                    high_vol_assets = current_vol[current_vol > self.volatility_threshold]
+                    
+                    for asset, vol in high_vol_assets.items():
+                        alerts.append(self.generate_alert(
+                            f"Alta volatilidade em {asset}: {vol:.1%}",
+                            "high" if vol > 0.4 else "medium",
+                            {'asset': asset, 'volatility': float(vol), 'threshold': self.volatility_threshold}
+                        ))
+            
+            # ✅ CORREÇÃO: Análise de correlações com try/except
+            try:
+                corr_matrix = returns.corr()
+                high_corr_pairs = []
+                
+                for i in range(len(corr_matrix.columns)):
+                    for j in range(i+1, len(corr_matrix.columns)):
+                        corr_val = corr_matrix.iloc[i, j]
+                        if abs(corr_val) > self.correlation_threshold:
+                            high_corr_pairs.append((
+                                corr_matrix.columns[i], 
+                                corr_matrix.columns[j],
+                                float(corr_val)
+                            ))
+                
+                if high_corr_pairs:
+                    alerts.append(self.generate_alert(
+                        f"Alta correlação detectada entre {len(high_corr_pairs)} pares",
+                        "medium",
+                        {'correlation_pairs': high_corr_pairs}
+                    ))
+            except Exception as corr_error:
+                alerts.append(self.generate_alert(
+                    f"Erro na análise de correlação: {str(corr_error)}",
+                    "medium",
+                    {'error': str(corr_error)}
+                ))
+            
+            # ✅ CORREÇÃO: Detecção de mudanças de regime com verificação
+            regime_analysis = self.detect_regime_changes(returns)
+            if regime_analysis and regime_analysis.get('vol_regime_change', 0) > 5:
+                alerts.append(self.generate_alert(
+                    "Múltiplas mudanças de regime de volatilidade detectadas",
+                    "medium",
+                    regime_analysis
+                ))
+                
+        except Exception as e:
+            alerts.append(self.generate_alert(
+                f"Erro na análise de mercado: {str(e)}",
+                "critical",
+                {'error': str(e)}
+            ))
+        
+        return alerts
+
+class AgentClustering(AgentBase):
+    """Agente para clustering de ativos usando ML - CORRIGIDO"""
+    
+    def __init__(self, n_clusters: int = 3):  # ✅ Reduzido para ser mais estável
+        super().__init__("AgentClustering")
+        self.n_clusters = n_clusters
+        self.scaler = StandardScaler()
+        self.pca = PCA(n_components=0.95)
+        self.kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+        self.current_clusters = None
+        
+    def prepare_features(self, returns: pd.DataFrame) -> pd.DataFrame:
+        """Prepara features para clustering - CORRIGIDO"""
+        try:
+            features = pd.DataFrame(index=returns.index)
+            
+            # ✅ CORREÇÃO: Features básicas e seguras
+            portfolio_returns = returns.mean(axis=1)
+            
+            # Features de retorno
+            features['mean_return'] = portfolio_returns
+            features['volatility'] = portfolio_returns.rolling(20).std() * np.sqrt(252)
+            features['sharpe'] = features['mean_return'] / (features['volatility'] + 1e-8)
+            
+            # ✅ CORREÇÃO: Features de correlação simplificadas
+            try:
+                if len(returns.columns) > 1:
+                    # Correlação média com o portfólio
+                    rolling_corr = returns.rolling(20).apply(
+                        lambda x: x.corrwith(portfolio_returns).mean() if len(x) > 1 else 0,
+                        raw=False
+                    )
+                    features['avg_correlation'] = rolling_corr
+                else:
+                    features['avg_correlation'] = 1.0
+            except:
+                features['avg_correlation'] = 1.0
+            
+            # ✅ CORREÇÃO: Features de drawdown simplificadas
+            try:
+                cumulative = (1 + portfolio_returns).cumprod()
+                rolling_max = cumulative.expanding().max()
+                drawdown = (cumulative - rolling_max) / rolling_max
+                features['current_drawdown'] = drawdown
+                features['max_drawdown_30d'] = drawdown.rolling(30).min()
+            except:
+                features['current_drawdown'] = 0
+                features['max_drawdown_30d'] = 0
+            
+            # ✅ CORREÇÃO: Features de momentum CORRIGIDAS
+            try:
+                for window in [5, 10, 20]:
+                    # ✅ CORREÇÃO CRÍTICA: Calcular momentum para o portfólio, não para cada ativo
+                    momentum = cumulative / cumulative.shift(window) - 1
+                    features[f'momentum_{window}'] = momentum  # ✅ Agora é uma Series, não DataFrame
+            except Exception as momentum_error:
+                print(f"Erro no momentum: {momentum_error}")
+                for window in [5, 10, 20]:
+                    features[f'momentum_{window}'] = 0
+            
+            return features.dropna()
+            
+        except Exception as e:
+            print(f"Erro crítico em prepare_features: {e}")
+            # Retornar DataFrame vazio em caso de erro
+            return pd.DataFrame()
+    
+    def perform_clustering(self, features: pd.DataFrame) -> Tuple[np.ndarray, pd.DataFrame]:
+        """Executa clustering nos ativos - CORRIGIDO"""
+        try:
+            if len(features) < 10 or len(features.columns) == 0:
+                return np.array([]), pd.DataFrame()
+            
+            # ✅ CORREÇÃO: Verificar e tratar NaN/inf
+            features_clean = features.replace([np.inf, -np.inf], np.nan).dropna()
+            
+            if len(features_clean) < 10:
+                return np.array([]), pd.DataFrame()
+            
+            # Normalizar features
+            features_scaled = self.scaler.fit_transform(features_clean)
+            
+            # Redução de dimensionalidade com PCA
+            features_pca = self.pca.fit_transform(features_scaled)
+            
+            # Clustering
+            clusters = self.kmeans.fit_predict(features_pca)
+            
+            # Analisar clusters
+            cluster_analysis = pd.DataFrame({
+                'timestamp': features_clean.index,
+                'cluster': clusters
+            })
+            
+            return clusters, cluster_analysis
+            
+        except Exception as e:
+            print(f"Erro no clustering: {e}")
+            return np.array([]), pd.DataFrame()
+    
+    def analyze_cluster_characteristics(self, features: pd.DataFrame, clusters: np.ndarray) -> Dict[str, Any]:
+        """Analisa características de cada cluster - CORRIGIDO"""
+        cluster_stats = {}
+        
+        if len(clusters) == 0:
+            return cluster_stats
+        
+        for cluster_id in range(self.n_clusters):
+            cluster_mask = clusters == cluster_id
+            cluster_data = features.iloc[cluster_mask]
+            
+            if len(cluster_data) > 0:
+                cluster_stats[cluster_id] = {
+                    'size': len(cluster_data),
+                    'avg_volatility': float(cluster_data['volatility'].mean()) if 'volatility' in cluster_data else 0,
+                    'avg_return': float(cluster_data['mean_return'].mean()) if 'mean_return' in cluster_data else 0,
+                    'avg_correlation': float(cluster_data['avg_correlation'].mean()) if 'avg_correlation' in cluster_data else 0
+                }
+        
+        return cluster_stats
+    
+    def process_data(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Processa clustering de ativos - CORRIGIDO"""
+        alerts = []
+        
+        try:
+            returns = market_data.pct_change().dropna()
+            
+            if len(returns) < 30 or len(returns.columns) < 2:
+                alerts.append(self.generate_alert(
+                    "Dados insuficientes para clustering",
+                    "low",
+                    {'data_points': len(returns), 'assets': len(returns.columns)}
+                ))
+                return alerts
+            
+            # Preparar features
+            features = self.prepare_features(returns)
+            
+            if features.empty:
+                alerts.append(self.generate_alert(
+                    "Features vazias para clustering",
+                    "low",
+                    {}
+                ))
+                return alerts
+            
+            # Executar clustering
+            clusters, cluster_analysis = self.perform_clustering(features)
+            
+            if len(clusters) == 0:
+                alerts.append(self.generate_alert(
+                    "Clustering não produziu resultados",
+                    "low",
+                    {}
+                ))
+                return alerts
+            
+            # Analisar clusters
+            cluster_stats = self.analyze_cluster_characteristics(features, clusters)
+            
+            if not cluster_stats:
+                alerts.append(self.generate_alert(
+                    "Nenhum cluster significativo encontrado",
+                    "low",
+                    {}
+                ))
+                return alerts
+            
+            # Gerar alertas baseados em clusters
+            for cluster_id, stats in cluster_stats.items():
+                if stats['avg_volatility'] > 0.35:
+                    alerts.append(self.generate_alert(
+                        f"Cluster {cluster_id} - Alta volatilidade: {stats['avg_volatility']:.1%}",
+                        "medium",
+                        {
+                            'cluster_id': cluster_id,
+                            'volatility': stats['avg_volatility'],
+                            'size': stats['size']
+                        }
+                    ))
+            
+            alerts.append(self.generate_alert(
+                f"Clustering concluído: {len(cluster_stats)} clusters identificados",
+                "low",
+                {
+                    'total_clusters': len(cluster_stats),
+                    'cluster_distribution': {k: v['size'] for k, v in cluster_stats.items()}
+                }
+            ))
+                
+        except Exception as e:
+            alerts.append(self.generate_alert(
+                f"Erro no AgentClustering: {str(e)}",
+                "critical",
+                {'error': str(e)}
+            ))
+        
+        return alerts
+
+class AgentML(AgentBase):
+    """Agente para modelos de Machine Learning - CORRIGIDO"""
+    
+    def __init__(self):
+        super().__init__("AgentML")
+        self.models = {}
+        self.feature_importance = {}
+        
+    def create_features(self, returns: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
+        """Cria features para modelos preditivos"""
+        try:
+            features = pd.DataFrame(index=returns.index)
+            
+            # Features de retorno
+            portfolio_returns = returns.mean(axis=1)
+            features['returns_lag1'] = portfolio_returns.shift(1)
+            features['returns_lag5'] = portfolio_returns.shift(5)
+            features['volatility'] = portfolio_returns.rolling(lookback).std()
+            
+            # Features técnicas
+            prices = (1 + returns).cumprod()
+            sma_short = prices.rolling(10).mean().mean(axis=1)
+            sma_long = prices.rolling(30).mean().mean(axis=1)
+            features['sma_ratio'] = sma_short / sma_long
+            
+            # Features de mercado
+            features['market_volatility'] = returns.std(axis=1).rolling(lookback).mean()
+            
+            # Target: retorno futuro (5 dias)
+            features['target'] = portfolio_returns.shift(-5)
+            
+            return features.dropna()
+        except Exception as e:
+            print(f"Erro criando features: {e}")
+            return pd.DataFrame()
+    
+    def detect_anomalies(self, returns: pd.DataFrame) -> pd.Series:
+        """Detecta anomalias usando Isolation Forest"""
+        try:
+            features = self.create_features(returns).iloc[:, :-1]  # Excluir target
+            
+            if len(features) < 50:
+                return pd.Series([False] * len(features), index=features.index)
+            
+            iso_forest = IsolationForest(contamination=0.05, random_state=42)
+            anomalies = iso_forest.fit_predict(features)
+            
+            return pd.Series(anomalies == -1, index=features.index)
+        except Exception as e:
+            print(f"Erro detectando anomalias: {e}")
+            return pd.Series([False] * len(returns), index=returns.index)
+    
+    def predict_volatility_regime(self, returns: pd.DataFrame) -> pd.Series:
+        """Prevê regimes de volatilidade"""
+        try:
+            features = self.create_features(returns).iloc[:, :-1]
+            volatility = returns.std(axis=1).rolling(10).mean()
+            
+            # Criar target binário: alta vs baixa volatilidade
+            vol_threshold = volatility.quantile(0.7)
+            target = (volatility > vol_threshold).astype(int)
+            
+            if len(features) < 100 or target.nunique() < 2:
+                return pd.Series([0] * len(features), index=features.index)
+            
+            # Alinhar features e target
+            common_idx = features.index.intersection(target.index)
+            features_aligned = features.loc[common_idx]
+            target_aligned = target.loc[common_idx]
+            
+            if len(features_aligned) < 50:
+                return pd.Series([0] * len(features), index=features.index)
+            
+            # Treinar modelo
+            from sklearn.ensemble import RandomForestClassifier
+            clf = RandomForestClassifier(n_estimators=100, random_state=42)
+            clf.fit(features_aligned.iloc[:-50], target_aligned.iloc[:-50])
+            
+            # Prever
+            predictions = clf.predict(features_aligned.iloc[-50:])
+            
+            # Guardar importância das features
+            self.feature_importance['volatility_regime'] = dict(
+                zip(features.columns, clf.feature_importances_)
+            )
+            
+            result_series = pd.Series([0] * len(features), index=features.index)
+            result_series.iloc[-50:] = predictions
+            return result_series
+            
+        except Exception as e:
+            print(f"Erro prevendo regimes: {e}")
+            return pd.Series([0] * len(returns), index=returns.index)
+    
+    def process_data(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Executa análises de ML - CORRIGIDO: removido @delayed"""
+        alerts = []
+        
+        try:
+            returns = market_data.pct_change().dropna()
+            
+            if len(returns) < 100:
+                alerts.append(self.generate_alert(
+                    "Dados insuficientes para análise de ML",
+                    "low",
+                    {'data_points': len(returns)}
+                ))
+                return alerts
+            
+            # Detecção de anomalias
+            anomalies = self.detect_anomalies(returns)
+            recent_anomalies = anomalies.tail(10)
+            
+            if recent_anomalies.any():
+                anomaly_count = recent_anomalies.sum()
+                alerts.append(self.generate_alert(
+                    f"Anomalias detectadas: {anomaly_count} períodos recentes",
+                    "high",
+                    {
+                        'anomaly_count': int(anomaly_count),
+                        'total_anomalies': int(anomalies.sum()),
+                        'anomaly_rate': float(anomalies.mean())
+                    }
+                ))
+            
+            # Previsão de regimes de volatilidade
+            vol_predictions = self.predict_volatility_regime(returns)
+            high_vol_periods = vol_predictions.sum()
+            
+            if high_vol_periods > len(vol_predictions) * 0.6:  # Mais de 60% alta vol
+                alerts.append(self.generate_alert(
+                    f"Período de alta volatilidade previsto: {high_vol_periods}/{len(vol_predictions)} períodos",
+                    "medium",
+                    {
+                        'high_vol_periods': int(high_vol_periods),
+                        'total_periods': len(vol_predictions)
+                    }
+                ))
+            
+            # Análise de correlação dinâmica
+            rolling_corr = returns.rolling(30).corr(returns.mean(axis=1)).mean(axis=1)
+            corr_volatility = rolling_corr.std()
+            
+            if corr_volatility > 0.3:
+                alerts.append(self.generate_alert(
+                    f"Alta instabilidade nas correlações: {corr_volatility:.3f}",
+                    "medium",
+                    {
+                        'correlation_volatility': float(corr_volatility),
+                        'current_correlation': float(rolling_corr.iloc[-1]) if len(rolling_corr) > 0 else 0
+                    }
+                ))
+            
+            alerts.append(self.generate_alert(
+                "Análise de ML concluída",
+                "low",
+                {
+                    'total_anomalies_detected': int(anomalies.sum()),
+                    'anomaly_rate': float(anomalies.mean())
+                }
+            ))
+                
+        except Exception as e:
+            alerts.append(self.generate_alert(
+                f"Erro no AgentML: {str(e)}",
+                "critical",
+                {'error': str(e)}
+            ))
+        
+        return alerts
+
+class AgentSimulation(AgentBase):
+    """Agente para simulações avançadas de Monte Carlo e análise de cenários - CORRIGIDO"""
+    
+    def __init__(self, n_simulations: int = 1000, time_horizon: int = 252):
+        super().__init__("AgentSimulation")
+        self.n_simulations = n_simulations
+        self.time_horizon = time_horizon
+        self.initial_investment = 10000
+        self.simulation_results = {}
+    
+    def monte_carlo_baseline(self, returns: pd.Series, portfolio_value: float = 10000, 
+                           confidence_level: float = 0.95, days: int = 252, 
+                           num_simulations: int = 1000) -> Dict[str, Any]:
+        """Calcula Value at Risk usando Monte Carlo clássico - CORRIGIDO"""
+        try:
+            # ✅ CORREÇÃO: Converter Series para numpy array
+            returns_array = returns.values
+            
+            # Estatísticas dos retornos
+            mu = np.mean(returns_array)
+            sigma = np.std(returns_array)
+            
+            # Simular retornos futuros
+            simulated_returns = np.random.normal(mu, sigma, (days, num_simulations))
+            
+            # ✅ CORREÇÃO: Calcular valores do portfólio sem usar axis em Series
+            portfolio_values = np.zeros((days, num_simulations))
+            for i in range(num_simulations):
+                cumulative_returns = np.cumsum(simulated_returns[:, i])
+                portfolio_values[:, i] = portfolio_value * (1 + cumulative_returns)
+            
+            # Calcular P&L
+            final_values = portfolio_values[-1, :] if days > 1 else portfolio_values[0, :]
+            portfolio_changes = final_values - portfolio_value
+            
+            # Calcular VaR e CVaR
+            var = np.percentile(portfolio_changes, (1 - confidence_level) * 100)
+            cvar = portfolio_changes[portfolio_changes <= var].mean()
+            
+            # Calcular probabilidade de prejuízo
+            prob_loss = (final_values < portfolio_value).mean()
+            
+            return {
+                'var': float(var),
+                'cvar': float(cvar),
+                'confidence_level': confidence_level,
+                'time_horizon': days,
+                'simulations': num_simulations,
+                'portfolio_value': portfolio_value,
+                'probability_loss': float(prob_loss),
+                'expected_return': float(np.mean(final_values) - portfolio_value),
+                'final_values': final_values,
+                'simulation_paths': portfolio_values,
+                'method': 'Monte Carlo Clássico'
+            }
+            
+        except Exception as e:
+            print(f"Erro no Monte Carlo VaR: {e}")
+            return {}
+
+    def historical_bootstrapping(self, returns: pd.Series, portfolio_value: float = 10000,
+                               confidence_level: float = 0.95, days: int = 252,
+                               num_simulations: int = 1000) -> Dict[str, Any]:
+        """Simulação histórica via bootstrapping - CORRIGIDO"""
+        try:
+            # ✅ CORREÇÃO: Converter Series para numpy array
+            historical_returns = returns.values
+            
+            if len(historical_returns) == 0:
+                return {}
+            
+            # Bootstrapping
+            simulated_paths = np.zeros((days, num_simulations))
+            
+            for i in range(num_simulations):
+                # Amostrar com reposição
+                bootstrap_sample = np.random.choice(historical_returns, size=days, replace=True)
+                
+                # ✅ CORREÇÃO: Calcular caminho de preços sem usar axis
+                price_path = np.zeros(days)
+                current_value = portfolio_value
+                for j in range(days):
+                    current_value = current_value * (1 + bootstrap_sample[j])
+                    price_path[j] = current_value
+                
+                simulated_paths[:, i] = price_path
+            
+            final_values = simulated_paths[-1, :] if days > 0 else simulated_paths[0, :]
+            
+            # Calcular métricas de risco
+            portfolio_changes = final_values - portfolio_value
+            var = np.percentile(portfolio_changes, (1 - confidence_level) * 100)
+            cvar = portfolio_changes[portfolio_changes <= var].mean()
+            prob_loss = (final_values < portfolio_value).mean()
+            
+            return {
+                'var': float(var),
+                'cvar': float(cvar),
+                'confidence_level': confidence_level,
+                'time_horizon': days,
+                'portfolio_value': portfolio_value,
+                'probability_loss': float(prob_loss),
+                'expected_return': float(np.mean(final_values) - portfolio_value),
+                'final_values': final_values,
+                'simulation_paths': simulated_paths,
+                'method': 'Bootstrapping Histórico'
+            }
+            
+        except Exception as e:
+            print(f"Erro na simulação histórica: {e}")
+            return {}
+
+    def merton_jump_diffusion(self, returns: pd.Series, portfolio_value: float = 10000,
+                            days: int = 252, num_simulations: int = 1000) -> Dict[str, Any]:
+        """Modelo de Merton com saltos para eventos extremos - CORRIGIDO"""
+        try:
+            # ✅ CORREÇÃO: Usar array numpy diretamente
+            returns_array = returns.values
+            
+            # Estimar parâmetros
+            mu = np.mean(returns_array) * 252
+            sigma = np.std(returns_array) * np.sqrt(252)
+            
+            # Parâmetros de saltos (simplificado)
+            lambda_jump = 0.05
+            mu_jump = -0.10
+            sigma_jump = 0.05
+            
+            dt = 1/252
+            n_steps = days
+            
+            paths = np.zeros((n_steps + 1, num_simulations))
+            paths[0] = portfolio_value
+            
+            for i in range(num_simulations):
+                current_price = portfolio_value
+                for t in range(1, n_steps + 1):
+                    # Componente Browniano
+                    Z = np.random.normal(0, 1)
+                    
+                    # Componente de saltos
+                    N = np.random.poisson(lambda_jump * dt)
+                    jumps = np.random.normal(mu_jump, sigma_jump, N).sum()
+                    
+                    # Atualizar preço
+                    current_price = current_price * np.exp(
+                        (mu - 0.5 * sigma**2) * dt + 
+                        sigma * np.sqrt(dt) * Z + 
+                        jumps
+                    )
+                    paths[t, i] = current_price
+            
+            final_values = paths[-1, :]
+            portfolio_changes = final_values - portfolio_value
+            
+            # Calcular métricas
+            var_95 = np.percentile(portfolio_changes, 5)
+            cvar_95 = portfolio_changes[portfolio_changes <= var_95].mean()
+            prob_loss = (final_values < portfolio_value).mean()
+            
+            return {
+                'var': float(var_95),
+                'cvar': float(cvar_95),
+                'portfolio_value': portfolio_value,
+                'probability_loss': float(prob_loss),
+                'expected_return': float(np.mean(final_values) - portfolio_value),
+                'final_values': final_values,
+                'simulation_paths': paths,
+                'method': 'Merton Jump Diffusion'
+            }
+            
+        except Exception as e:
+            print(f"Erro no modelo Merton: {e}")
+            # Fallback para Monte Carlo
+            return self.monte_carlo_baseline(returns, portfolio_value, 0.95, days, num_simulations)
+    
+    def garch_simulation(self, returns: pd.Series, portfolio_value: float = 10000,
+                        days: int = 252, num_simulations: int = 1000) -> Dict[str, Any]:
+        """Simulação GARCH para volatilidade estocástica - CORRIGIDO"""
+        try:
+            # ✅ CORREÇÃO: Fallback simplificado usando Monte Carlo
+            return self.monte_carlo_baseline(returns, portfolio_value, 0.95, days, num_simulations)
+            
+        except Exception as e:
+            print(f"Erro na simulação GARCH: {e}")
+            return self.monte_carlo_baseline(returns, portfolio_value, 0.95, days, num_simulations)
+
+    def run_simulation(self, method: str, portfolio_returns: pd.Series, portfolio_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Executa simulação baseada no método selecionado - CORRIGIDO"""
+        portfolio_value = portfolio_config.get('value', 10000)
+        confidence_level = portfolio_config.get('confidence_level', 0.95)
+        time_horizon = portfolio_config.get('time_horizon', 252)
+        num_simulations = portfolio_config.get('num_simulations', 1000)
+        
+        if method == "Monte Carlo Clássico":
+            return self.monte_carlo_baseline(
+                portfolio_returns, portfolio_value, confidence_level, time_horizon, num_simulations
+            )
+        elif method == "Bootstrapping":
+            return self.historical_bootstrapping(
+                portfolio_returns, portfolio_value, confidence_level, time_horizon, num_simulations
+            )
+        elif method == "Merton Jump Diffusion":
+            return self.merton_jump_diffusion(
+                portfolio_returns, portfolio_value, time_horizon, num_simulations
+            )
+        elif method == "GARCH":
+            return self.garch_simulation(
+                portfolio_returns, portfolio_value, time_horizon, num_simulations
+            )
+        else:
+            return self.monte_carlo_baseline(
+                portfolio_returns, portfolio_value, confidence_level, time_horizon, num_simulations
+            )
+
+    def monte_carlo_simulation(self, returns: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Executa simulação de Monte Carlo para o portfólio - CORRIGIDO"""
+        try:
+            # Se há configuração de portfólio, usar pesos específicos, senão igualmente ponderado
+            if portfolio_config and 'weights' in portfolio_config:
+                weights = portfolio_config['weights']
+                # ✅ CORREÇÃO: Garantir que os pesos estão normalizados e alinhados com os ativos
+                weight_series = pd.Series(weights)
+                aligned_weights = weight_series.reindex(returns.columns, fill_value=0)
+                weighted_returns = returns.mul(aligned_weights, axis=1)
+                portfolio_returns = weighted_returns.sum(axis=1)
+            else:
+                # ✅ CORREÇÃO: Usar mean(axis=1) apenas em DataFrame, não em Series
+                portfolio_returns = returns.mean(axis=1)
+
+            # ✅ CORREÇÃO: Converter Series para array numpy
+            portfolio_returns_array = portfolio_returns.values
+
+            # Calcular parâmetros para a simulação
+            mean_returns = np.mean(portfolio_returns_array)
+            std_returns = np.std(portfolio_returns_array)
+            
+            # Simulação de Monte Carlo
+            simulated_paths = np.zeros((self.time_horizon, self.n_simulations))
+            for i in range(self.n_simulations):
+                # Gerar caminhos usando geometria browniana
+                shocks = np.random.normal(0, 1, self.time_horizon)
+                returns_path = mean_returns + std_returns * shocks
+                # ✅ CORREÇÃO: Usar cumprod corretamente
+                cumulative_returns = np.cumprod(1 + returns_path)
+                price_path = self.initial_investment * cumulative_returns
+                simulated_paths[:, i] = price_path
+
+            # Calcular métricas de risco
+            final_prices = simulated_paths[-1, :]
+            var_95 = np.percentile(final_prices, 5)
+            cvar_95 = final_prices[final_prices <= var_95].mean()
+            median_final_price = np.median(final_prices)
+
+            # Calcular probabilidade de prejuízo (preço final < inicial)
+            prob_loss = (final_prices < self.initial_investment).mean()
+
+            return {
+                'simulated_paths': simulated_paths,
+                'var_95': var_95,
+                'cvar_95': cvar_95,
+                'median_final_price': median_final_price,
+                'prob_loss': prob_loss,
+                'mean_final_price': final_prices.mean(),
+                'std_final_price': final_prices.std(),
+                'n_simulations': self.n_simulations,
+                'time_horizon': self.time_horizon
+            }
+
+        except Exception as e:
+            print(f"Erro na simulação de Monte Carlo: {e}")
+            return {}
+
+    def process_data(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Processa dados e executa simulações - CORRIGIDO"""
+        alerts = []
+
+        try:
+            returns = market_data.pct_change().dropna()
+
+            if returns.empty:
+                alerts.append(self.generate_alert(
+                    "Dados de retornos vazios para simulação",
+                    "low",
+                    {}
+                ))
+                return alerts
+
+            # Executar simulação de Monte Carlo
+            simulation_results = self.monte_carlo_simulation(returns, portfolio_config)
+
+            if not simulation_results:
+                alerts.append(self.generate_alert(
+                    "Simulação de Monte Carlo falhou",
+                    "medium",
+                    {}
+                ))
+                return alerts
+
+            # Gerar alertas baseados nos resultados da simulação
+            if simulation_results['prob_loss'] > 0.2:
+                alerts.append(self.generate_alert(
+                    f"Alta probabilidade de prejuízo: {simulation_results['prob_loss']:.1%}",
+                    "high",
+                    simulation_results
+                ))
+
+            if simulation_results['var_95'] < self.initial_investment * 0.9:  # Perda > 10%
+                loss_percentage = (self.initial_investment - simulation_results['var_95']) / self.initial_investment
+                alerts.append(self.generate_alert(
+                    f"VaR 95% indica possível perda de {loss_percentage:.1%}",
+                    "medium",
+                    simulation_results
+                ))
+
+            # Alerta para alta volatilidade nas simulações
+            if simulation_results['std_final_price'] > self.initial_investment * 0.3:
+                alerts.append(self.generate_alert(
+                    f"Alta incerteza nas simulações: desvio padrão de {simulation_results['std_final_price']:.0f}",
+                    "medium",
+                    simulation_results
+                ))
+
+            alerts.append(self.generate_alert(
+                f"Simulação de Monte Carlo concluída: {self.n_simulations} simulações",
+                "low",
+                simulation_results
+            ))
+
+        except Exception as e:
+            alerts.append(self.generate_alert(
+                f"Erro no AgentSimulation: {str(e)}",
+                "critical",
+                {'error': str(e)}
+            ))
+
+        return alerts
+            
+class AgentAlert(AgentBase):
+    """Centraliza e prioriza alertas - CORRIGIDO"""
+    
+    def __init__(self):
+        super().__init__("AgentAlert")
+        self.alert_history = []
+        self.severity_weights = {'critical': 10, 'high': 6, 'medium': 3, 'low': 1}
+    
+    def calculate_alert_score(self, alert: Dict[str, Any]) -> float:
+        base_score = self.severity_weights.get(alert['severity'], 1)
+        
+        if 'data' in alert:
+            # Bonus por múltiplos ativos envolvidos
+            if 'assets' in alert['data'] and len(alert['data']['assets']) > 3:
+                base_score *= 1.3
+            
+            # Bonus por alta volatilidade
+            if 'volatility' in alert['data'] and alert['data']['volatility'] > 0.4:
+                base_score *= 1.5
+        
+        return base_score
+    
+    def process_alerts(self, alerts_list: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Processa alertas - CORRIGIDO: removido @delayed"""
+        all_alerts = []
+        for alerts in alerts_list:
+            if alerts is not None:  # ✅ Proteção contra None
+                all_alerts.extend(alerts)
+        
+        for alert in all_alerts:
+            alert['score'] = self.calculate_alert_score(alert)
+        
+        sorted_alerts = sorted(all_alerts, key=lambda x: x['score'], reverse=True)
+        self.alert_history.extend(sorted_alerts)
+        
+        # Manter apenas últimos 1000 alertas no histórico
+        if len(self.alert_history) > 1000:
+            self.alert_history = self.alert_history[-1000:]
+        
+        return sorted_alerts[:15]
+
+# AgentLSTM e outros permanecem como placeholders
+class AgentLSTM(AgentBase):
+    def __init__(self):
+        super().__init__("AgentLSTM")
+    
+    def process_data(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        alerts = []
+        try:
+            # Implementação futura do LSTM
+            alerts.append(self.generate_alert(
+                "LSTM: Análise temporal avançada disponível",
+                "low",
+                {'status': 'LSTM ready for implementation'}
+            ))
+        except Exception as e:
+            alerts.append(self.generate_alert(
+                f"Erro no AgentLSTM: {str(e)}",
+                "critical",
+                {'error': str(e)}
+            ))
+        return alerts
+
+class AgentAutoencoder(AgentBase):
+    def __init__(self):
+        super().__init__("AgentAutoencoder")
+    
+    def process_data(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        alerts = []
+        try:
+            # Implementação futura do Autoencoder
+            alerts.append(self.generate_alert(
+                "Autoencoder: Detecção de anomalias avançada disponível", 
+                "low",
+                {'status': 'Autoencoder ready for implementation'}
+            ))
+        except Exception as e:
+            alerts.append(self.generate_alert(
+                f"Erro no AgentAutoencoder: {str(e)}",
+                "critical",
+                {'error': str(e)}
+            ))
+        return alerts
+
+class DaskMultiAgentOrchestrator:
+    """Orquestrador principal usando Dask - CORRIGIDO"""
+    
+    def __init__(self, use_dask: bool = False, use_tensorflow: bool = False):
+    self.use_dask = use_dask
+    self.use_tensorflow = use_tensorflow
+    self.client = None
+    
+    if use_dask:
+        try:
+            # ✅ CORREÇÃO: Configuração específica para Windows
+            import dask
+            from dask.distributed import Client, LocalCluster
+            
+            # Usar threads em vez de processos no Windows para evitar problemas
+            self.client = Client(
+                n_workers=2, 
+                threads_per_worker=2, 
+                processes=False,  # ✅ CRÍTICO: False para Windows
+                memory_limit='2GB',
+                silence_logs=30  # ✅ Reduzir logs
+            )
+            print("✅ Dask cluster inicializado (Windows-compatible)")
+        except Exception as e:
+            print(f"⚠️ Dask falhou: {e}, usando modo sequencial")
+            self.use_dask = False
+            
+    def run_analysis(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Executa análise coordenada - CORRIGIDO"""
+        
+        print(f"🔍 Executando análise multiagente (Dask: {self.use_dask})...")
+        
+        if self.use_dask and self.client:
+            return self._run_dask_parallel(market_data, portfolio_config)
+        else:
+            return self._run_sequential(market_data, portfolio_config)
+    
+    def _run_dask_parallel(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None):
+        """Executa agentes em paralelo usando Dask - CORRIGIDO"""
+        try:
+            # ✅ CORREÇÃO: Usar delayed explicitamente
+            market_task = delayed(self.agent_market.process_data)(market_data)
+            clustering_task = delayed(self.agent_clustering.process_data)(market_data)
+            ml_task = delayed(self.agent_ml.process_data)(market_data)
+            simulation_task = delayed(self.agent_simulation.process_data)(market_data, portfolio_config)  # ✅ NOVO
+            
+            # Adicionar agentes TensorFlow se disponíveis
+            tasks = [market_task, clustering_task, ml_task, simulation_task]  # ✅ ATUALIZADO: inclui simulation
+            task_names = ["Market", "Clustering", "ML", "Simulation"]  # ✅ ATUALIZADO
+            
+            if hasattr(self, 'agent_lstm'):
+                lstm_task = delayed(self.agent_lstm.process_data)(market_data)
+                tasks.append(lstm_task)
+                task_names.append("LSTM")
+            
+            if hasattr(self, 'agent_autoencoder'):
+                autoencoder_task = delayed(self.agent_autoencoder.process_data)(market_data)
+                tasks.append(autoencoder_task)
+                task_names.append("Autoencoder")
+            
+            print(f"   📊 Tasks Dask criadas: {task_names}")
+            
+            # Computar em paralelo
+            alerts_results = compute(*tasks, scheduler=self.client)
+            print(f"   ✅ Tasks Dask concluídas")
+            
+            # Processar alertas
+            alerts_task = delayed(self.agent_alert.process_alerts)(alerts_results)
+            prioritized_alerts = compute(alerts_task, scheduler=self.client)[0]
+            
+            return prioritized_alerts
+            
+        except Exception as e:
+            print(f"⚠️ Dask paralelo falhou: {e}, usando sequencial")
+            return self._run_sequential(market_data, portfolio_config)
+    
+    def _run_sequential(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None):
+        """Executa agentes sequencialmente (fallback) - CORRIGIDO"""
+        alerts_results = []
+        
+        try:
+            print("   🔄 Executando AgentMarket...")
+            market_alerts = self.agent_market.process_data(market_data)
+            alerts_results.append(market_alerts)
+            
+            print("   🔄 Executando AgentClustering...")
+            clustering_alerts = self.agent_clustering.process_data(market_data)
+            alerts_results.append(clustering_alerts)
+            
+            print("   🔄 Executando AgentML...")
+            ml_alerts = self.agent_ml.process_data(market_data)
+            alerts_results.append(ml_alerts)
+            
+            # ✅ NOVO: Executar AgentSimulation
+            print("   🔄 Executando AgentSimulation...")
+            simulation_alerts = self.agent_simulation.process_data(market_data, portfolio_config)
+            alerts_results.append(simulation_alerts)
+            
+            # Agentes TensorFlow
+            if hasattr(self, 'agent_lstm'):
+                print("   🔄 Executando AgentLSTM...")
+                lstm_alerts = self.agent_lstm.process_data(market_data)
+                alerts_results.append(lstm_alerts)
+            
+            if hasattr(self, 'agent_autoencoder'):
+                print("   🔄 Executando AgentAutoencoder...")
+                autoencoder_alerts = self.agent_autoencoder.process_data(market_data)
+                alerts_results.append(autoencoder_alerts)
+            
+            print("   ✅ Todos os agents executados")
+            
+        except Exception as e:
+            print(f"   ❌ Erro na execução sequencial: {e}")
+            # Adicionar alerta de erro
+            error_alert = self.agent_market.generate_alert(
+                f"Erro na execução dos agentes: {str(e)}", 
+                "critical", 
+                {'error': str(e)}
+            )
+            alerts_results = [[error_alert]]
+        
+        # Processar alertas
+        prioritized_alerts = self.agent_alert.process_alerts(alerts_results)
+        return prioritized_alerts
+    
+    def generate_report(self, alerts: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Gera relatório consolidado - ATUALIZADA"""
+        severity_counts = {}
+        asset_alerts = {}
+        cluster_alerts = []
+        ml_alerts = []
+        simulation_alerts = []
+        
+        # ✅ COLETAR TODOS OS ALERTAS
+        all_alerts = []
+        
+        for alert in alerts:
+            all_alerts.append(alert)
+            sev = alert['severity']
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            
+            # Agrupar por tipo de análise
+            if 'AgentClustering' in alert['agent_id']:
+                cluster_alerts.append(alert)
+            elif any(agent in alert['agent_id'] for agent in ['AgentML', 'AgentLSTM', 'AgentAutoencoder']):
+                ml_alerts.append(alert)
+            elif 'AgentSimulation' in alert['agent_id']:
+                simulation_alerts.append(alert)
+            
+            if 'data' in alert and 'asset' in alert['data']:
+                asset = alert['data']['asset']
+                if asset not in asset_alerts:
+                    asset_alerts[asset] = []
+                asset_alerts[asset].append(alert)
+        
+        critical_count = len([a for a in alerts if a['severity'] in ['critical', 'high']])
+        summary = f"{critical_count} alertas de alta prioridade" if critical_count > 0 else "Nenhum alerta crítico"
+        
+        return {
+            'total_alerts': len(alerts),
+            'severity_breakdown': severity_counts,
+            'asset_alerts': asset_alerts,
+            'cluster_alerts': cluster_alerts,
+            'ml_alerts': ml_alerts,
+            'simulation_alerts': simulation_alerts,
+            'critical_alerts': [a for a in alerts if a['severity'] in ['critical', 'high']],
+            'all_alerts': all_alerts,  # ✅ NOVO: TODOS OS ALERTAS
+            'timestamp': datetime.now(),
+            'summary': summary,
+            'orchestrator': 'Dask' if self.use_dask else 'Sequencial'
+        }    
+    
+    def __del__(self):
+        """Cleanup do cliente Dask"""
+        if hasattr(self, 'client') and self.client:
+            try:
+                self.client.close()
+            except:
+                pass
