@@ -195,9 +195,12 @@ class AdvancedRiskSimulators:
         try:
             L = np.linalg.cholesky(corr_matrix)
         except np.linalg.LinAlgError:
-            # Se matriz não for positiva definida, usar correlação aproximada
-            print("⚠️  Matriz não é positiva definida, usando correlação diagonal")
-            L = np.linalg.cholesky(corr_matrix + np.eye(len(corr_matrix)) * 0.01)
+            # Corrigir matriz via autovalores para garantir PSD
+            print("⚠️  Matriz não é positiva definida, aplicando correção espectral")
+            eigenvalues, eigenvectors = np.linalg.eigh(corr_matrix)
+            eigenvalues = np.maximum(eigenvalues, 1e-8)
+            psd_matrix = eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
+            L = np.linalg.cholesky(psd_matrix)
         
         Z = np.random.normal(0, 1, (num_simulations, len(self.returns.columns)))
         correlated_normals = Z @ L.T

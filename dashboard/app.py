@@ -869,36 +869,6 @@ def display_all_alerts_with_filters(report):
     with col3:
         agents_involved = len(set(a['agent_id'] for a in all_alerts))
         st.metric("🤖 Agentes", agents_involved)
-
-    with col4:
-        recent_alerts = len([a for a in all_alerts if a.get('timestamp') and 
-                        (datetime.now() - a['timestamp']).days < 1])
-        st.metric("🕐 Últimas 24h", recent_alerts)
-                                    
-def display_all_alerts_with_filters(report):
-    """Exibe todos os alertas com sistema de filtros avançado"""
-    if not report or 'all_alerts' not in report:
-        st.info("📭 Nenhum alerta gerado ainda. Execute a análise multiagente primeiro.")
-        return
-    
-    st.markdown('<div class="section-header">🚨 Sistema de Gestão de Alertas</div>', unsafe_allow_html=True)
-    
-    all_alerts = report['all_alerts']
-    
-    # Estatísticas rápidas
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        total_alerts = len(all_alerts)
-        st.metric("📊 Total de Alertas", total_alerts)
-    
-    with col2:
-        critical_high = len([a for a in all_alerts if a['severity'] in ['critical', 'high']])
-        st.metric("🔥 Críticos/Altos", critical_high)
-    
-    with col3:
-        agents_involved = len(set(a['agent_id'] for a in all_alerts))
-        st.metric("🤖 Agentes", agents_involved)
     
     with col4:
         recent_alerts = len([a for a in all_alerts if a.get('timestamp') and 
@@ -1081,11 +1051,11 @@ def display_single_alert(alert):
     
     st.markdown("---")
 
-def run_simulation_corrected(algorithm: str, returns_df: pd.DataFrame, initial_investment: float, 
+def run_simulation_corrected(algorithm: str, returns_df: pd.DataFrame, initial_investment: float,
                            time_horizon: int, num_simulations: int, weights: Optional[Dict[str, float]] = None):
     """Executa simulação com parâmetros corretos - CORRIGIDA"""
     try:
-        from src.agents.dask_orchestrator import AgentSimulation
+        from src.agents.agent_simulation import AgentSimulation
         
         simulator = AgentSimulation()
         
@@ -1198,7 +1168,16 @@ st.markdown("""
     * {
         font-family: 'EB Garamond', serif;
     }
-    
+
+    html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+        background-color: #0e1117 !important;
+        color: #f0f2f6 !important;
+    }
+
+    [data-testid="stSidebar"] {
+        background-color: #1e2130 !important;
+    }
+
     .main {
         background-color: #0e1117;
         color: #f0f2f6;
@@ -2155,8 +2134,8 @@ with tab4:
         with st.spinner(f"Executando {algorithm}..."):
             try:
                 # Importar e executar simulação
-                from src.agents.dask_orchestrator import AgentSimulation
-                
+                from src.agents.agent_simulation import AgentSimulation
+
                 # Configurar parâmetros do portfólio
                 portfolio_config = {
                     'value': initial_investment,
@@ -2165,7 +2144,7 @@ with tab4:
                     'weights': get_current_weights(selected_assets),
                     'num_simulations': num_simulations
                 }
-                
+
                 # Executar agente de simulação
                 agent_sim = AgentSimulation()
                 simulation_alerts = agent_sim.process_data(prices_filtered, portfolio_config)

@@ -3,17 +3,28 @@ import numpy as np
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 import warnings
-from dask import delayed, compute
-from dask.distributed import Client, LocalCluster
-import joblib
+import sys
+import os
+
+try:
+    from dask import delayed, compute
+    HAS_DASK = True
+except ImportError:
+    HAS_DASK = False
+    def delayed(f): return f
+    def compute(*args, **kwargs): return args
+
+try:
+    import joblib
+    HAS_JOBLIB = True
+except ImportError:
+    HAS_JOBLIB = False
+
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans, DBSCAN
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
-import warnings
-import sys
-import os
 
 # ✅ CORREÇÃO: Importar AgentBase do arquivo separado
 try:
@@ -973,28 +984,34 @@ class DaskMultiAgentOrchestrator:
     """Orquestrador principal usando Dask - CORRIGIDO"""
     
     def __init__(self, use_dask: bool = False, use_tensorflow: bool = False):
-    self.use_dask = use_dask
-    self.use_tensorflow = use_tensorflow
-    self.client = None
-    
-    if use_dask:
-        try:
-            # ✅ CORREÇÃO: Configuração específica para Windows
-            import dask
-            from dask.distributed import Client, LocalCluster
-            
-            # Usar threads em vez de processos no Windows para evitar problemas
-            self.client = Client(
-                n_workers=2, 
-                threads_per_worker=2, 
-                processes=False,  # ✅ CRÍTICO: False para Windows
-                memory_limit='2GB',
-                silence_logs=30  # ✅ Reduzir logs
-            )
-            print("✅ Dask cluster inicializado (Windows-compatible)")
-        except Exception as e:
-            print(f"⚠️ Dask falhou: {e}, usando modo sequencial")
-            self.use_dask = False
+        self.use_dask = use_dask
+        self.use_tensorflow = use_tensorflow
+        self.client = None
+
+        # Inicializar todos os agentes
+        self.agent_market = AgentMarket()
+        self.agent_clustering = AgentClustering()
+        self.agent_ml = AgentML()
+        self.agent_simulation = AgentSimulation()
+        self.agent_alert = AgentAlert()
+        self.agent_lstm = AgentLSTM()
+        self.agent_autoencoder = AgentAutoencoder()
+
+        if use_dask:
+            try:
+                from dask.distributed import Client
+
+                self.client = Client(
+                    n_workers=2,
+                    threads_per_worker=2,
+                    processes=False,
+                    memory_limit='2GB',
+                    silence_logs=30
+                )
+                print("✅ Dask cluster inicializado")
+            except Exception as e:
+                print(f"⚠️ Dask falhou: {e}, usando modo sequencial")
+                self.use_dask = False
             
     def run_analysis(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Executa análise coordenada - CORRIGIDO"""

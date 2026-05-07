@@ -42,14 +42,10 @@ class AgentSimulation(AgentBase):
             mean_returns = portfolio_returns.mean()
             std_returns = portfolio_returns.std()
             
-            # Simulação de Monte Carlo
-            simulated_paths = np.zeros((self.time_horizon, self.n_simulations))
-            for i in range(self.n_simulations):
-                # Gerar caminhos usando geometria browniana
-                shocks = np.random.normal(0, 1, self.time_horizon)
-                returns_path = mean_returns + std_returns * shocks
-                price_path = self.initial_investment * (1 + returns_path).cumprod()
-                simulated_paths[:, i] = price_path
+            # Simulação de Monte Carlo (vetorizada)
+            shocks = np.random.normal(0, 1, (self.time_horizon, self.n_simulations))
+            returns_path = mean_returns + std_returns * shocks
+            simulated_paths = self.initial_investment * np.cumprod(1 + returns_path, axis=0)
 
             # Calcular métricas de risco
             final_prices = simulated_paths[-1, :]

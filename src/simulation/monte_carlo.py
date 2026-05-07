@@ -31,13 +31,12 @@ class MonteCarloSimulator:
             # Aplicar correlação
             correlated_returns = np.dot(random_returns, L.T) + self.mean_returns.values
             
-            # Calcular caminhos de preços para cada ativo
-            asset_paths = np.zeros((self.time_horizon + 1, self.num_simulations, len(self.returns.columns)))
-            asset_paths[0] = initial_value / len(self.returns.columns)
-            
-            for t in range(1, self.time_horizon + 1):
-                asset_paths[t] = asset_paths[t-1] * (1 + correlated_returns[t-1])
-            
+            # Calcular caminhos de preços para cada ativo (vetorizado)
+            n_assets = len(self.returns.columns)
+            asset_paths = np.zeros((self.time_horizon + 1, self.num_simulations, n_assets))
+            asset_paths[0] = initial_value / n_assets
+            asset_paths[1:] = (initial_value / n_assets) * np.cumprod(1 + correlated_returns, axis=0)
+
             # Portfolio total (soma de todos os ativos)
             portfolio_paths = asset_paths.sum(axis=2)
             
@@ -68,10 +67,8 @@ class MonteCarloSimulator:
         
         portfolio_paths = np.zeros((self.time_horizon + 1, self.num_simulations))
         portfolio_paths[0] = initial_value
-        
-        for t in range(1, self.time_horizon + 1):
-            portfolio_paths[t] = portfolio_paths[t-1] * (1 + random_returns[t-1])
-        
+        portfolio_paths[1:] = initial_value * np.cumprod(1 + random_returns, axis=0)
+
         self.portfolio_paths = portfolio_paths
         return portfolio_paths
     
@@ -92,7 +89,8 @@ class MonteCarloSimulator:
         
         # Value at Risk e Conditional VaR
         var = np.percentile(returns_simulated, (1 - confidence_level) * 100)
-        cvar = returns_simulated[returns_simulated <= var].mean()
+        tail = returns_simulated[returns_simulated <= var]
+        cvar = tail.mean() if len(tail) > 0 else var
         
         # Probabilidades
         prob_loss = (returns_simulated < 0).mean()
@@ -205,15 +203,14 @@ class MonteCarloSimulator:
             random_returns = np.random.normal(0, 1, (self.time_horizon, self.num_simulations, len(self.returns.columns)))
             correlated_returns = np.dot(random_returns, L_stressed.T) + stressed_mean.values
             
-            asset_paths_stressed = np.zeros((self.time_horizon + 1, self.num_simulations, len(self.returns.columns)))
-            asset_paths_stressed[0] = 1000 / len(self.returns.columns)
-            
-            for t in range(1, self.time_horizon + 1):
-                asset_paths_stressed[t] = asset_paths_stressed[t-1] * (1 + correlated_returns[t-1])
-            
+            n_assets = len(self.returns.columns)
+            asset_paths_stressed = np.zeros((self.time_horizon + 1, self.num_simulations, n_assets))
+            asset_paths_stressed[0] = 1000 / n_assets
+            asset_paths_stressed[1:] = (1000 / n_assets) * np.cumprod(1 + correlated_returns, axis=0)
             portfolio_paths_stressed = asset_paths_stressed.sum(axis=2)
-            
-        except:
+
+        except Exception as e:
+            print(f"⚠️  Cholesky falhou no stress test, usando fallback simples: {e}")
             # Fallback para simulação simples
             portfolio_vol_stressed = stressed_returns.mean(axis=1).std()
             portfolio_mean_stressed = stressed_returns.mean(axis=1).mean()
@@ -226,14 +223,12 @@ class MonteCarloSimulator:
             
             portfolio_paths_stressed = np.zeros((self.time_horizon + 1, self.num_simulations))
             portfolio_paths_stressed[0] = 1000
-            
-            for t in range(1, self.time_horizon + 1):
-                portfolio_paths_stressed[t] = portfolio_paths_stressed[t-1] * (1 + random_returns[t-1])
+            portfolio_paths_stressed[1:] = 1000 * np.cumprod(1 + random_returns, axis=0)
         
         # Comparar resultados
         normal_final = np.median(self.portfolio_paths[-1])
         stressed_final = np.median(portfolio_paths_stressed[-1])
-        impact = (stressed_final - normal_final) / normal_final
+        impact = (stressed_final - normal_final) / normal_final if normal_final != 0 else 0.0
         
         stress_results = {
             'Cenarios_Testados': shock_scenarios,

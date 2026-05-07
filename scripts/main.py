@@ -7,8 +7,8 @@ from datetime import datetime, timedelta
 import os
 import sys
 
-# Adicionar o diretório atual ao path
-sys.path.append('/app')
+# Adicionar o diretório raiz do projeto ao path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scripts.fetch_bcb_data import fetch_economic_indicators
 
