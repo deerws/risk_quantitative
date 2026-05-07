@@ -19,13 +19,163 @@ warnings.filterwarnings('ignore')
 
 class AgentSimulation(AgentBase):
     """Agente para simulações de Monte Carlo e análise de cenários - CORRIGIDO"""
-    
+
     def __init__(self, n_simulations: int = 1000, time_horizon: int = 252):
         super().__init__("AgentSimulation")
         self.n_simulations = n_simulations
         self.time_horizon = time_horizon
         self.initial_investment = 10000
-    
+        self.simulation_results: Dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # Métodos de simulação individuais (chamados por run_simulation)
+    # ------------------------------------------------------------------
+
+    def monte_carlo_baseline(self, returns: pd.Series, portfolio_value: float = 10000,
+                             confidence_level: float = 0.95, days: int = 252,
+                             num_simulations: int = 1000) -> Dict[str, Any]:
+        """Monte Carlo clássico com distribuição normal."""
+        try:
+            r = np.asarray(returns)
+            mu, sigma = r.mean(), r.std()
+            shocks = np.random.normal(mu, sigma, (days, num_simulations))
+            paths = portfolio_value * np.cumprod(1 + shocks, axis=0)
+            final = paths[-1]
+            changes = final - portfolio_value
+            var = np.percentile(changes, (1 - confidence_level) * 100)
+            tail = changes[changes <= var]
+            cvar = float(tail.mean()) if len(tail) > 0 else float(var)
+            return {
+                'var': float(var), 'cvar': cvar,
+                'confidence_level': confidence_level, 'time_horizon': days,
+                'simulations': num_simulations, 'portfolio_value': portfolio_value,
+                'probability_loss': float((final < portfolio_value).mean()),
+                'expected_return': float(final.mean() - portfolio_value),
+                'final_values': final, 'simulation_paths': paths,
+                'method': 'Monte Carlo Clássico'
+            }
+        except Exception as e:
+            print(f"Erro em monte_carlo_baseline: {e}")
+            return {}
+
+    def historical_bootstrapping(self, returns: pd.Series, portfolio_value: float = 10000,
+                                 confidence_level: float = 0.95, days: int = 252,
+                                 num_simulations: int = 1000) -> Dict[str, Any]:
+        """Bootstrapping histórico — reamostragem com reposição."""
+        try:
+            r = np.asarray(returns)
+            if len(r) == 0:
+                return {}
+            idx = np.random.randint(0, len(r), size=(days, num_simulations))
+            sampled = r[idx]
+            paths = portfolio_value * np.cumprod(1 + sampled, axis=0)
+            final = paths[-1]
+            changes = final - portfolio_value
+            var = np.percentile(changes, (1 - confidence_level) * 100)
+            tail = changes[changes <= var]
+            cvar = float(tail.mean()) if len(tail) > 0 else float(var)
+            return {
+                'var': float(var), 'cvar': cvar,
+                'confidence_level': confidence_level, 'time_horizon': days,
+                'simulations': num_simulations, 'portfolio_value': portfolio_value,
+                'probability_loss': float((final < portfolio_value).mean()),
+                'expected_return': float(final.mean() - portfolio_value),
+                'final_values': final, 'simulation_paths': paths,
+                'method': 'Bootstrapping'
+            }
+        except Exception as e:
+            print(f"Erro em historical_bootstrapping: {e}")
+            return {}
+
+    def merton_jump_diffusion(self, returns: pd.Series, portfolio_value: float = 10000,
+                              days: int = 252, num_simulations: int = 1000) -> Dict[str, Any]:
+        """Merton Jump Diffusion — eventos extremos com saltos."""
+        try:
+            r = np.asarray(returns)
+            mu = r.mean() * 252
+            sigma = r.std() * np.sqrt(252)
+            lambda_j, mu_j, sigma_j = 0.05, -0.10, 0.05
+            dt = 1 / 252
+            Z = np.random.normal(0, 1, (days, num_simulations))
+            N = np.random.poisson(lambda_j * dt, (days, num_simulations))
+            J = np.random.normal(mu_j, sigma_j, (days, num_simulations)) * N
+            log_ret = (mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * Z + J
+            paths = portfolio_value * np.cumprod(np.exp(log_ret), axis=0)
+            final = paths[-1]
+            changes = final - portfolio_value
+            var = np.percentile(changes, 5)
+            tail = changes[changes <= var]
+            cvar = float(tail.mean()) if len(tail) > 0 else float(var)
+            return {
+                'var': float(var), 'cvar': cvar,
+                'confidence_level': 0.95, 'time_horizon': days,
+                'simulations': num_simulations, 'portfolio_value': portfolio_value,
+                'probability_loss': float((final < portfolio_value).mean()),
+                'expected_return': float(final.mean() - portfolio_value),
+                'final_values': final, 'simulation_paths': paths,
+                'method': 'Merton Jump Diffusion'
+            }
+        except Exception as e:
+            print(f"Erro em merton_jump_diffusion: {e}")
+            return self.monte_carlo_baseline(returns, portfolio_value, 0.95, days, num_simulations)
+
+    def garch_simulation(self, returns: pd.Series, portfolio_value: float = 10000,
+                         days: int = 252, num_simulations: int = 1000) -> Dict[str, Any]:
+        """GARCH(1,1) simplificado — volatilidade variante no tempo."""
+        try:
+            r = np.asarray(returns)
+            omega = r.var() * 0.05
+            alpha, beta = 0.10, 0.85
+            sigma2_0 = r.var()
+            paths = np.zeros((days, num_simulations))
+            for s in range(num_simulations):
+                sigma2 = sigma2_0
+                value = portfolio_value
+                for t in range(days):
+                    eps = np.random.normal(0, np.sqrt(sigma2))
+                    value *= (1 + eps)
+                    paths[t, s] = value
+                    sigma2 = omega + alpha * eps**2 + beta * sigma2
+            final = paths[-1]
+            changes = final - portfolio_value
+            var = np.percentile(changes, 5)
+            tail = changes[changes <= var]
+            cvar = float(tail.mean()) if len(tail) > 0 else float(var)
+            return {
+                'var': float(var), 'cvar': cvar,
+                'confidence_level': 0.95, 'time_horizon': days,
+                'simulations': num_simulations, 'portfolio_value': portfolio_value,
+                'probability_loss': float((final < portfolio_value).mean()),
+                'expected_return': float(final.mean() - portfolio_value),
+                'final_values': final, 'simulation_paths': paths,
+                'method': 'GARCH'
+            }
+        except Exception as e:
+            print(f"Erro em garch_simulation: {e}")
+            return self.monte_carlo_baseline(returns, portfolio_value, 0.95, days, num_simulations)
+
+    def run_simulation(self, method: str, portfolio_returns: pd.Series,
+                       portfolio_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatcher: executa o método de simulação solicitado."""
+        pv = portfolio_config.get('value', 10000)
+        cl = portfolio_config.get('confidence_level', 0.95)
+        th = portfolio_config.get('time_horizon', 252)
+        ns = portfolio_config.get('num_simulations', 1000)
+
+        dispatch = {
+            'Monte Carlo Clássico': lambda: self.monte_carlo_baseline(portfolio_returns, pv, cl, th, ns),
+            'Bootstrapping':        lambda: self.historical_bootstrapping(portfolio_returns, pv, cl, th, ns),
+            'Merton Jump Diffusion':lambda: self.merton_jump_diffusion(portfolio_returns, pv, th, ns),
+            'GARCH':                lambda: self.garch_simulation(portfolio_returns, pv, th, ns),
+        }
+        fn = dispatch.get(method, dispatch['Monte Carlo Clássico'])
+        result = fn()
+        if result:
+            self.simulation_results[method] = result
+        return result
+
+    # ------------------------------------------------------------------
+
     def monte_carlo_simulation(self, returns: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Executa simulação de Monte Carlo para o portfólio - CORRIGIDO"""
         try:
@@ -121,6 +271,8 @@ class AgentSimulation(AgentBase):
                     "medium",
                     simulation_results
                 ))
+
+            self.simulation_results['Monte Carlo Clássico'] = simulation_results
 
             alerts.append(self.generate_alert(
                 f"Simulação de Monte Carlo concluída: {self.n_simulations} simulações",

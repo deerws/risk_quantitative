@@ -1427,33 +1427,99 @@ if 'orchestrator' not in st.session_state:
 # FUNÇÕES AUXILIARES
 # =============================================
 
-def load_data():
-    """Carrega os dados do portfólio"""
+# ------------------------------------------------------------------
+# Presets de ativos por categoria
+# ------------------------------------------------------------------
+ASSET_PRESETS = {
+    "🇧🇷 B3":    ["PETR4.SA", "VALE3.SA", "ITUB4.SA", "BBDC4.SA", "ABEV3.SA", "WEGE3.SA"],
+    "🇺🇸 NYSE":  ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"],
+    "₿ Crypto":  ["BTC-USD", "ETH-USD", "SOL-USD"],
+    "📊 ETFs":   ["SPY", "QQQ", "BOVA11.SA", "IVVB11.SA"],
+    "💱 Forex":  ["USDBRL=X", "EURBRL=X", "JPYBRL=X"],
+}
+
+PERIOD_OPTIONS = ["1M", "3M", "6M", "1A", "2A", "5A", "Personalizado"]
+PERIOD_MAP     = {"1M": "1mo", "3M": "3mo", "6M": "6mo",
+                  "1A": "1y",  "2A": "2y",  "5A": "5y", "Personalizado": "custom"}
+
+BACEN_SERIES = {
+    "SELIC (%)":    11,
+    "IPCA (%)":     433,
+    "Câmbio BRL":   1,
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_portfolio_data(tickers_tuple: tuple, period: str,
+                         custom_start: str = None, custom_end: str = None):
+    """Baixa preços via yfinance. Retorna (returns, prices_norm_100)."""
+    if not tickers_tuple:
+        return pd.DataFrame(), pd.DataFrame()
+
+    tickers = list(tickers_tuple)
     try:
-        returns = pd.read_parquet('data/processed/macro_portfolio_returns.parquet')
-        prices = pd.read_parquet('data/processed/macro_portfolio_prices.parquet')
-        return returns, prices
-    except:
+        import yfinance as yf
+
+        kwargs = dict(auto_adjust=True, progress=False)
+        if period == "custom" and custom_start and custom_end:
+            raw = yf.download(tickers, start=custom_start, end=custom_end, **kwargs)
+        else:
+            raw = yf.download(tickers, period=period, **kwargs)
+
+        if raw.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        # Extrair coluna Close (multi-index quando vários tickers)
+        if isinstance(raw.columns, pd.MultiIndex):
+            prices = raw["Close"].copy()
+        else:
+            prices = raw[["Close"]].copy()
+            prices.columns = [tickers[0]]
+
+        # Remover ativos sem dados suficientes (> 50% NaN)
+        prices = prices.dropna(axis=1, thresh=max(1, int(len(prices) * 0.5)))
+        prices = prices.ffill().bfill().dropna()
+
+        if prices.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        # Normalizar a 100 no início → comparação justa entre ativos de escalas diferentes
+        prices_norm = prices.div(prices.iloc[0]) * 100
+
+        returns = prices.pct_change().dropna()
+        return returns, prices_norm
+
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_bacen_macro(series_codes: tuple):
+    """Baixa séries do BACEN via API SGS. Retorna DataFrame com as séries."""
+    import requests
+    from datetime import date
+
+    results = {}
+    for name, code in series_codes:
         try:
-            returns = pd.read_csv('data/processed/macro_portfolio_returns.csv', index_col=0, parse_dates=True)
-            prices = pd.read_csv('data/processed/macro_portfolio_prices.csv', index_col=0, parse_dates=True)
-            return returns, prices
-        except Exception as e:
-            st.error(f"Erro ao carregar dados: {e}")
-            # Criar dados de exemplo para demonstração
-            st.info("🔄 Criando dados de exemplo para demonstração...")
-            dates = pd.date_range('2020-01-01', periods=500, freq='D')
-            np.random.seed(42)
-            example_data = {
-                'SELIC': np.random.normal(0.0003, 0.005, 500),
-                'USD_BRL': np.random.normal(0.0005, 0.008, 500),
-                'PETROLEO_BRENT': np.random.normal(0.0008, 0.012, 500),
-                'IBOVESPA': np.random.normal(0.001, 0.015, 500),
-                'CRYPTO_BTC': np.random.normal(0.002, 0.025, 500)
-            }
-            returns = pd.DataFrame(example_data, index=dates)
-            prices = (1 + returns).cumprod() * 100
-            return returns, prices
+            url = (f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados"
+                   f"?formato=json&dataInicial=01/01/2020&dataFinal={date.today().strftime('%d/%m/%Y')}")
+            resp = requests.get(url, timeout=10)
+            if resp.ok:
+                df = pd.DataFrame(resp.json())
+                df["data"] = pd.to_datetime(df["data"], dayfirst=True)
+                df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+                df = df.set_index("data")["valor"].dropna()
+                results[name] = df
+        except Exception:
+            pass
+
+    if not results:
+        return pd.DataFrame()
+
+    macro = pd.DataFrame(results)
+    macro.index = pd.to_datetime(macro.index)
+    return macro.sort_index()
 
 def get_current_weights(selected_assets):
     """Calcula pesos atuais baseados na seleção"""
@@ -1655,91 +1721,189 @@ def display_agent_analytics(alerts):
             st.plotly_chart(fig_severity, use_container_width=True)
 
 # =============================================
-# CARREGAMENTO DE DADOS
+# SIDEBAR — BUSCA DE ATIVOS & CONFIGURAÇÕES
 # =============================================
 
-# Carregar dados
-returns, prices = load_data()
+st.sidebar.markdown('<div class="section-header">🔍 Busca de Ativos</div>', unsafe_allow_html=True)
 
-if returns is None or prices is None:
-    st.error("""
-    **Dados não encontrados!**
-    
-    Execute primeiro o pipeline completo:
-    ```bash
-    python src/etl/data_collector_bcb.py
-    python src/metrics/risk_calculator.py
-    ```
+# --- Estado inicial dos tickers ---
+if "tickers_text" not in st.session_state:
+    st.session_state.tickers_text = "PETR4.SA, VALE3.SA, ITUB4.SA, BBDC4.SA, WEGE3.SA"
+if "selected_period" not in st.session_state:
+    st.session_state.selected_period = "3M"
+if "custom_start" not in st.session_state:
+    st.session_state.custom_start = None
+if "custom_end" not in st.session_state:
+    st.session_state.custom_end = None
+if "portfolio_data" not in st.session_state:
+    st.session_state.portfolio_data = (pd.DataFrame(), pd.DataFrame())
+if "data_timestamp" not in st.session_state:
+    st.session_state.data_timestamp = None
+if "invalid_tickers" not in st.session_state:
+    st.session_state.invalid_tickers = []
+
+# --- Presets rápidos ---
+st.sidebar.markdown("**Pré-seleções rápidas:**")
+preset_cols = st.sidebar.columns(len(ASSET_PRESETS))
+for col, (label, tickers_preset) in zip(preset_cols, ASSET_PRESETS.items()):
+    with col:
+        if st.button(label, key=f"preset_{label}", use_container_width=True):
+            st.session_state.tickers_text = ", ".join(tickers_preset)
+
+# --- Input de tickers ---
+tickers_input = st.sidebar.text_area(
+    "Tickers (separados por vírgula ou nova linha):",
+    value=st.session_state.tickers_text,
+    height=100,
+    placeholder="PETR4.SA, VALE3.SA, AAPL, BTC-USD",
+    key="tickers_text_area",
+    help="B3: PETR4.SA  |  NYSE: AAPL  |  Crypto: BTC-USD  |  Forex: USDBRL=X"
+)
+st.session_state.tickers_text = tickers_input
+
+# --- Seletor de período ---
+st.sidebar.markdown("**📅 Período de análise:**")
+period_label = st.sidebar.radio(
+    "Período",
+    options=PERIOD_OPTIONS,
+    index=PERIOD_OPTIONS.index(st.session_state.selected_period),
+    horizontal=True,
+    label_visibility="collapsed",
+    key="period_radio"
+)
+st.session_state.selected_period = period_label
+
+custom_start_str, custom_end_str = None, None
+if period_label == "Personalizado":
+    c1, c2 = st.sidebar.columns(2)
+    with c1:
+        cs = st.date_input("Início", key="custom_start_input")
+    with c2:
+        ce = st.date_input("Fim", key="custom_end_input")
+    custom_start_str = str(cs)
+    custom_end_str   = str(ce)
+
+# --- Botão Atualizar ---
+col_btn, col_info = st.sidebar.columns([1, 1])
+with col_btn:
+    fetch_btn = st.button("🔄 Atualizar Dados", type="primary",
+                          use_container_width=True, key="fetch_data_btn")
+with col_info:
+    if st.session_state.data_timestamp:
+        st.caption(f"⏱ {st.session_state.data_timestamp}")
+
+# --- Parâmetros de risco ---
+st.sidebar.markdown("---")
+st.sidebar.markdown("**🎯 Parâmetros de Risco**")
+risk_free_rate   = st.sidebar.slider("Taxa Livre de Risco (% a.a):", 0.0, 20.0, 11.75, 0.1) / 100
+confidence_level = st.sidebar.slider("Nível de Confiança VaR:", 0.90, 0.99, 0.95, 0.01)
+
+# --- Overlay BACEN ---
+st.sidebar.markdown("---")
+st.sidebar.markdown("**📊 Overlay Macroeconômico (BACEN)**")
+bacen_selections = st.sidebar.multiselect(
+    "Séries macroeconômicas:",
+    options=list(BACEN_SERIES.keys()),
+    default=[],
+    key="bacen_overlay_select"
+)
+
+# --- Configurações avançadas ---
+st.sidebar.markdown("---")
+st.sidebar.markdown("**🔧 Configurações Avançadas**")
+use_dask           = st.sidebar.checkbox("Usar Dask (Processamento Paralelo)", value=False)
+use_tensorflow     = st.sidebar.checkbox("Usar TensorFlow (Deep Learning)", value=False)
+enable_clustering  = st.sidebar.checkbox("Ativar Clustering de Ativos", value=True)
+enable_ml_detection= st.sidebar.checkbox("Ativar Detecção ML", value=True)
+
+# --- Tech Stack badges ---
+st.sidebar.markdown("---")
+st.sidebar.markdown("**🛠️ Tech Stack:**")
+st.sidebar.markdown(
+    '<span class="tech-badge">yfinance</span>'
+    '<span class="tech-badge">Dask</span>'
+    '<span class="tech-badge">Scikit-learn</span>'
+    '<span class="tech-badge">6 Agents</span>',
+    unsafe_allow_html=True
+)
+
+# =============================================
+# FETCH + FILTRAGEM DE DADOS
+# =============================================
+
+def _parse_tickers(raw: str) -> tuple:
+    """Normaliza texto de tickers em uma tupla imutável (para cache key)."""
+    import re
+    tokens = re.split(r"[,\n\r]+", raw)
+    cleaned = [t.strip().upper() for t in tokens if t.strip()]
+    return tuple(dict.fromkeys(cleaned))  # Remove duplicatas, preserva ordem
+
+# Disparar fetch quando botão clicado ou ainda sem dados
+should_fetch = fetch_btn or st.session_state.portfolio_data[0].empty
+
+if should_fetch:
+    tickers_tuple = _parse_tickers(tickers_input)
+    if tickers_tuple:
+        yf_period = PERIOD_MAP[period_label]
+        with st.spinner(f"Baixando dados de {len(tickers_tuple)} ativo(s)..."):
+            ret, prc = fetch_portfolio_data(
+                tickers_tuple, yf_period, custom_start_str, custom_end_str
+            )
+        if not ret.empty:
+            st.session_state.portfolio_data  = (ret, prc)
+            st.session_state.data_timestamp  = datetime.now().strftime("%H:%M:%S")
+            # Tickers inválidos = os que não vieram nos dados
+            fetched = set(ret.columns.tolist())
+            st.session_state.invalid_tickers = [t for t in tickers_tuple if t not in fetched]
+        else:
+            st.error("❌ Nenhum dado retornado. Verifique os tickers e tente novamente.")
+    else:
+        st.warning("⚠️ Insira ao menos um ticker válido.")
+
+returns, prices = st.session_state.portfolio_data
+
+# Alertas de tickers inválidos
+if st.session_state.invalid_tickers:
+    st.warning(f"⚠️ Tickers não encontrados: **{', '.join(st.session_state.invalid_tickers)}**")
+
+if returns.empty:
+    st.info("""
+    **👈 Comece adicionando ativos na barra lateral.**
+
+    Exemplos:
+    - Ações B3: `PETR4.SA`, `VALE3.SA`, `ITUB4.SA`
+    - NYSE/NASDAQ: `AAPL`, `NVDA`, `MSFT`
+    - Crypto: `BTC-USD`, `ETH-USD`
+    - Forex: `USDBRL=X`
+    - ETFs: `BOVA11.SA`, `SPY`
+
+    Use os botões de pré-seleção na sidebar para começar rapidamente!
     """)
     st.stop()
 
-# =============================================
-# SIDEBAR - CONFIGURAÇÕES
-# =============================================
-
-st.sidebar.markdown('<div class="section-header">⚙️ Configurações do Sistema</div>', unsafe_allow_html=True)
-
-# Configurações de Tech Stack
-st.sidebar.markdown("**🛠️ Tech Stack Ativo:**")
-col_tech1, col_tech2 = st.sidebar.columns(2)
-with col_tech1:
-    st.markdown('<span class="tech-badge">Dask</span>', unsafe_allow_html=True)
-    st.markdown('<span class="tech-badge">TensorFlow</span>', unsafe_allow_html=True)
-with col_tech2:
-    st.markdown('<span class="tech-badge">Scikit-learn</span>', unsafe_allow_html=True) 
-    st.markdown('<span class="tech-badge">6 Agents</span>', unsafe_allow_html=True)
-
-# Seleção de ativos
-st.sidebar.markdown("**📊 Configuração do Portfólio**")
+# --- Filtro de ativos carregados (multiselect) ---
+all_loaded = returns.columns.tolist()
 selected_assets = st.sidebar.multiselect(
-    "Selecione os ativos para análise:",
-    options=returns.columns.tolist(),
-    default=returns.columns.tolist()[:5] if len(returns.columns) >= 5 else returns.columns.tolist()
+    "**📌 Ativos no portfólio:**",
+    options=all_loaded,
+    default=all_loaded,
+    key="asset_multiselect"
 )
+if not selected_assets:
+    selected_assets = all_loaded
 
-# Parâmetros de risco
-st.sidebar.markdown("**🎯 Parâmetros de Risco**")
-risk_free_rate = st.sidebar.slider("Taxa Livre de Risco (% a.a):", 0.0, 20.0, 11.75, 0.1) / 100
-confidence_level = st.sidebar.slider("Nível de Confiança VaR:", 0.90, 0.99, 0.95, 0.01)
+returns_filtered  = returns[selected_assets]
+prices_filtered   = prices[selected_assets]
 
-# Configurações avançadas
-st.sidebar.markdown("**🔧 Configurações Avançadas**")
-use_dask = st.sidebar.checkbox("Usar Dask (Processamento Paralelo)", value=True)
-use_tensorflow = st.sidebar.checkbox("Usar TensorFlow (Deep Learning)", value=True)
-enable_clustering = st.sidebar.checkbox("Ativar Clustering de Ativos", value=True)
-enable_ml_detection = st.sidebar.checkbox("Ativar Detecção ML", value=True)
+# Retorno ponderado do portfólio (pesos iguais)
+portfolio_returns = returns_filtered.mean(axis=1)
 
-# Filtro de período
-st.sidebar.markdown("**📅 Período de Análise**")
-min_date = returns.index.min().date()
-max_date = returns.index.max().date()
-
-col1, col2 = st.sidebar.columns(2)
-with col1:
-    start_date = st.date_input("Data Início", value=min_date, min_value=min_date, max_value=max_date)
-with col2:
-    end_date = st.date_input("Data Fim", value=max_date, min_value=min_date, max_value=max_date)
-
-# =============================================
-# FILTRAGEM DE DADOS
-# =============================================
-
-# Filtrar dados
-if selected_assets:
-    returns_filtered = returns[selected_assets].loc[str(start_date):str(end_date)]
-    prices_filtered = prices[selected_assets].loc[str(start_date):str(end_date)]
-else:
-    returns_filtered = returns.loc[str(start_date):str(end_date)]
-    prices_filtered = prices.loc[str(start_date):str(end_date)]
-
-# Calcular retorno do portfólio
-weights = get_current_weights(selected_assets)
-if weights:
-    weight_sum = sum(weights.values())
-    normalized_weights = {k: v/weight_sum for k, v in weights.items()}
-    portfolio_returns = (returns_filtered * pd.Series(normalized_weights)).sum(axis=1)
-else:
-    portfolio_returns = returns_filtered.mean(axis=1)
+# --- Overlay macroeconômico (BACEN) ---
+macro_df = pd.DataFrame()
+if bacen_selections:
+    selected_codes = tuple((k, BACEN_SERIES[k]) for k in bacen_selections)
+    with st.spinner("Carregando dados do BACEN..."):
+        macro_df = fetch_bacen_macro(selected_codes)
 
 # =============================================
 # LAYOUT PRINCIPAL COM ABAS
@@ -1784,7 +1948,7 @@ with tab1:
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("📊 Evolução dos Preços")
+        st.subheader("📊 Desempenho Normalizado (Base 100)")
         fig_prices = go.Figure()
         for asset in prices_filtered.columns:
             fig_prices.add_trace(go.Scatter(
@@ -1793,14 +1957,28 @@ with tab1:
                 name=asset,
                 line=dict(width=2)
             ))
+        # Overlay BACEN (eixo secundário)
+        if not macro_df.empty:
+            for col in macro_df.columns:
+                fig_prices.add_trace(go.Scatter(
+                    x=macro_df.index,
+                    y=macro_df[col],
+                    name=col,
+                    line=dict(width=1, dash="dot"),
+                    yaxis="y2",
+                    opacity=0.7
+                ))
         fig_prices.update_layout(
-            height=400, 
+            height=400,
             showlegend=True,
             plot_bgcolor='rgba(0,0,0,0)',
             paper_bgcolor='rgba(0,0,0,0)',
             font=dict(color='#f0f2f6'),
             xaxis=dict(gridcolor='#333'),
-            yaxis=dict(gridcolor='#333')
+            yaxis=dict(gridcolor='#333', title="Base 100"),
+            yaxis2=dict(overlaying="y", side="right", gridcolor='#222',
+                        title="BACEN", showgrid=False) if not macro_df.empty else {},
+            legend=dict(bgcolor='rgba(0,0,0,0)')
         )
         st.plotly_chart(fig_prices, use_container_width=True)
     
@@ -2128,39 +2306,22 @@ with tab4:
     
     # ✅ CORREÇÃO: Botão com key única e controle de estado
     if st.button("🎲 Executar Simulação", type="primary", key="run_simulation_button_tab4"):
-        # Manter na mesma aba
-        st.session_state.active_tab = "🎯 Simulações"
-        
         with st.spinner(f"Executando {algorithm}..."):
-            try:
-                # Importar e executar simulação
-                from src.agents.agent_simulation import AgentSimulation
-
-                # Configurar parâmetros do portfólio
-                portfolio_config = {
-                    'value': initial_investment,
-                    'confidence_level': 0.95,
-                    'time_horizon': time_horizon,
-                    'weights': get_current_weights(selected_assets),
-                    'num_simulations': num_simulations
-                }
-
-                # Executar agente de simulação
-                agent_sim = AgentSimulation()
-                simulation_alerts = agent_sim.process_data(prices_filtered, portfolio_config)
-                
-                # ✅ CORREÇÃO: Armazenar resultados na sessão
-                if hasattr(agent_sim, 'simulation_results') and agent_sim.simulation_results:
-                    st.session_state.current_simulation_results = agent_sim.simulation_results
-                    st.success(f"✅ Simulação {algorithm} concluída com sucesso!")
-                    
-                    # ✅ CORREÇÃO: Forçar atualização da interface
-                    st.rerun()
-                else:
-                    st.warning("⚠️ Simulação executada, mas nenhum resultado foi gerado")
-                    
-            except Exception as e:
-                st.error(f"❌ Erro na simulação: {str(e)}")
+            result = run_simulation_corrected(
+                algorithm=algorithm,
+                returns_df=returns_filtered,
+                initial_investment=initial_investment,
+                time_horizon=time_horizon,
+                num_simulations=num_simulations,
+                weights=get_current_weights(selected_assets)
+            )
+            if result:
+                existing = st.session_state.get('current_simulation_results', {})
+                existing[algorithm] = result
+                st.session_state.current_simulation_results = existing
+                st.success(f"✅ {algorithm} concluído!")
+            else:
+                st.warning("⚠️ Simulação não retornou resultados")
     
     # ✅ CORREÇÃO: Exibir resultados se existirem na sessão
     if 'current_simulation_results' in st.session_state and st.session_state.current_simulation_results:
@@ -2216,10 +2377,9 @@ with tab4:
                 
                 # Armazenar resultados
                 if simulation_results:
+                    st.session_state.current_simulation_results = simulation_results
                     st.session_state.last_simulation_results = simulation_results
                     st.success(f"✅ {len(simulation_results)} métodos executados com sucesso!")
-                    
-                    # Exibir resultados consolidados
                     display_simulation_results(simulation_results, initial_investment)
                 else:
                     st.error("❌ Nenhuma simulação foi bem-sucedida")
