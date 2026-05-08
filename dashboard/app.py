@@ -45,6 +45,125 @@ st.set_page_config(
 # FUNÇÕES DE EXPORTAÇÃO E GRÁFICOS AVANÇADOS
 # =============================================
 
+def _fig_png(fig) -> bytes:
+    """Converte figura Plotly para PNG via kaleido."""
+    try:
+        return fig.to_image(format="png", scale=2)
+    except Exception:
+        # fallback para HTML se kaleido não estiver disponível
+        return fig.to_html(include_plotlyjs="cdn", full_html=True).encode("utf-8")
+
+
+def _fig_mime(fig) -> tuple[bytes, str, str]:
+    """Retorna (bytes, mime_type, extensão) — PNG se kaleido ok, HTML senão."""
+    try:
+        return fig.to_image(format="png", scale=2), "image/png", "png"
+    except Exception:
+        return fig.to_html(include_plotlyjs="cdn", full_html=True).encode("utf-8"), "text/html", "html"
+
+
+def _dl_chart_btn(label: str, fig, basename: str, key: str, **kw):
+    """Renderiza st.download_button para um gráfico Plotly (PNG ou HTML)."""
+    _b, _m, _e = _fig_mime(fig)
+    ext_label = label.replace("(HTML)", f"({_e.upper()})")
+    st.download_button(ext_label, _b, f"{basename}.{_e}", _m, key=key, **kw)
+
+
+def _build_export_excel(simulation_results: dict, initial_investment: float) -> BytesIO:
+    """Gera Excel multi-aba com todos os dados das simulações."""
+    output = BytesIO()
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        wb = writer.book
+        curr_fmt = wb.add_format({"num_format": "R$ #,##0.00"})
+        pct_fmt  = wb.add_format({"num_format": "0.00%"})
+
+        # --- Resumo executivo ---
+        summary = []
+        for method, r in simulation_results.items():
+            summary.append({
+                "Método": method,
+                "VaR 95% (R$)": abs(r.get("var", 0)),
+                "CVaR 95% (R$)": abs(r.get("cvar", 0)),
+                "Prob. Prejuízo": r.get("probability_loss", 0),
+                "Retorno Esperado (R$)": r.get("expected_return", 0),
+                "Simulações": r.get("simulations", 0),
+                "Horizonte (dias)": r.get("time_horizon", 0),
+            })
+        df_summary = pd.DataFrame(summary)
+        df_summary.to_excel(writer, sheet_name="Resumo", index=False)
+        ws = writer.sheets["Resumo"]
+        ws.write(0, 8, f"Gerado em: {ts}")
+        ws.write(1, 8, f"Investimento Inicial: R$ {initial_investment:,.2f}")
+        ws.set_column("B:C", 18, curr_fmt)
+        ws.set_column("D:D", 16, pct_fmt)
+        ws.set_column("E:E", 22, curr_fmt)
+
+        # --- Estatísticas descritivas ---
+        stats_rows = []
+        for method, r in simulation_results.items():
+            if "final_values" in r and len(r["final_values"]) > 0:
+                fv = np.array(r["final_values"])
+                losses = initial_investment - fv
+                stats_rows.append({
+                    "Método": method,
+                    "Média Valor Final": float(np.mean(fv)),
+                    "Mediana Valor Final": float(np.median(fv)),
+                    "Desvio Padrão": float(np.std(fv)),
+                    "Mínimo": float(np.min(fv)),
+                    "Máximo": float(np.max(fv)),
+                    "VaR 95%": abs(r.get("var", 0)),
+                    "CVaR 95%": abs(r.get("cvar", 0)),
+                    "Prob. Prejuízo": r.get("probability_loss", 0),
+                    "Retorno Esperado": r.get("expected_return", 0),
+                    "Skewness": float(pd.Series(fv).skew()),
+                    "Kurtosis": float(pd.Series(fv).kurt()),
+                    "Perda Média": float(np.mean(losses)),
+                    "Perda Máxima": float(np.max(losses)),
+                })
+        if stats_rows:
+            df_stats = pd.DataFrame(stats_rows)
+            df_stats.to_excel(writer, sheet_name="Estatísticas", index=False)
+
+        # --- Dados brutos por método ---
+        for method, r in simulation_results.items():
+            if "final_values" in r and len(r["final_values"]) > 0:
+                fv = np.array(r["final_values"])
+                df_m = pd.DataFrame({
+                    "Valor Final (R$)": fv,
+                    "Perda (R$)": initial_investment - fv,
+                    "Retorno (%)": (fv - initial_investment) / initial_investment,
+                })
+                sheet = (method[:27] + "_sim")[:31]
+                df_m.to_excel(writer, sheet_name=sheet, index=False)
+
+        # --- Stress Analysis ---
+        stress_rows = []
+        for method, r in simulation_results.items():
+            if "var" in r and "probability_loss" in r:
+                var_impact = abs(r["var"]) / initial_investment
+                loss_prob = r["probability_loss"]
+                if loss_prob > 0.3 or var_impact > 0.2:
+                    nivel = "ALTO"
+                elif loss_prob > 0.15 or var_impact > 0.1:
+                    nivel = "MÉDIO"
+                else:
+                    nivel = "BAIXO"
+                stress_rows.append({
+                    "Método": method,
+                    "Impacto VaR (%)": var_impact,
+                    "Prob. Prejuízo": loss_prob,
+                    "Nível de Stress": nivel,
+                })
+        if stress_rows:
+            df_stress = pd.DataFrame(stress_rows)
+            df_stress.to_excel(writer, sheet_name="Stress", index=False)
+
+    output.seek(0)
+    return output
+
+
 def display_simulation_results(simulation_results: dict, initial_investment: float):
     """Exibe resultados das simulações com gráficos profissionais para mercado financeiro - CORRIGIDA"""
     
@@ -98,6 +217,22 @@ def display_simulation_results(simulation_results: dict, initial_investment: flo
     with col4:
         total_simulations = sum(results.get('simulations', 0) for results in current_results.values())
         st.metric("Cenários Simulados", f"{total_simulations:,}")
+
+    # Botão "Exportar tudo" sempre visível, acima das abas
+    st.markdown("---")
+    _exp_col, _ = st.columns([1, 3])
+    with _exp_col:
+        _excel_bytes = _build_export_excel(current_results, initial_investment)
+        st.download_button(
+            label="⬇️ Exportar tudo (Excel multi-aba)",
+            data=_excel_bytes,
+            file_name=f"quantum_risk_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="export_tudo_top",
+            help="Resumo, estatísticas, dados brutos por método e análise de stress em uma planilha.",
+            use_container_width=True,
+        )
+    st.markdown("---")
 
     # Abas para diferentes visualizações
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -185,7 +320,8 @@ def display_loss_distribution(simulation_results: dict, initial_investment: floa
                 )
                 
                 st.plotly_chart(fig1, use_container_width=True)
-            
+                _dl_chart_btn("⬇️ Distribuição (HTML)", fig1, "distribuicao_perdas", f"dl_fig1_{selected_method}", use_container_width=True)
+
             with col2:
                 # CDF (Função de Distribuição Acumulada)
                 sorted_losses = np.sort(losses)
@@ -219,7 +355,8 @@ def display_loss_distribution(simulation_results: dict, initial_investment: floa
                 )
                 
                 st.plotly_chart(fig2, use_container_width=True)
-            
+                _dl_chart_btn("⬇️ CDF (HTML)", fig2, "cdf_perdas", f"dl_fig2_{selected_method}", use_container_width=True)
+
             # ✅ CORREÇÃO: Estatísticas detalhadas
             st.markdown("##### 📊 Estatísticas Detalhadas")
             stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
@@ -328,6 +465,7 @@ def display_simulation_paths(simulation_results: dict):
                 )
                 
                 st.plotly_chart(fig, use_container_width=True)
+                _dl_chart_btn("⬇️ Trajetórias (HTML)", fig, f"trajetorias_{selected_method}", f"dl_paths_{selected_method}")
             else:
                 st.warning(f"⚠️ Dados de trajetórias não disponíveis para {selected_method}")
         else:
@@ -376,7 +514,8 @@ def display_methods_comparison(simulation_results: dict):
                 font=dict(color='white')
             )
             st.plotly_chart(fig_var, use_container_width=True)
-        
+            _dl_chart_btn("⬇️ VaR por Método (HTML)", fig_var, "var_por_metodo", "dl_fig_var_comp", use_container_width=True)
+
         with col2:
             # Scatter plot: VaR vs Prob. Prejuízo
             fig_scatter = px.scatter(
@@ -394,7 +533,8 @@ def display_methods_comparison(simulation_results: dict):
                 font=dict(color='white')
             )
             st.plotly_chart(fig_scatter, use_container_width=True)
-        
+            _dl_chart_btn("⬇️ VaR vs Prob (HTML)", fig_scatter, "var_vs_prob", "dl_fig_scatter_comp", use_container_width=True)
+
         # Tabela comparativa
         st.markdown("#### 📋 Métricas Comparativas")
         display_df = methods_df.copy()
@@ -466,7 +606,8 @@ def display_stress_analysis(simulation_results: dict, initial_investment: float)
         fig.update_yaxes(tickformat=".0%", title="Probabilidade de Prejuízo")
         
         st.plotly_chart(fig, use_container_width=True)
-        
+        _dl_chart_btn("⬇️ Mapa de Stress (HTML)", fig, "stress_analysis", "dl_stress_scatter")
+
         # Recomendações baseadas no stress
         st.markdown("#### 💡 Recomendações de Gestão de Risco")
         
@@ -587,76 +728,173 @@ def export_to_excel(simulation_results: dict, initial_investment: float):
         st.error(f"❌ Erro ao exportar para Excel: {e}")
 
 def export_to_pdf(simulation_results: dict, initial_investment: float):
-    """Gera relatório PDF profissional - CORRIGIDA"""
+    """Relatório PDF consolidado: simulações + métricas por ativo + alertas + LSTM + Autoencoder."""
     try:
-        # ✅ CORREÇÃO: Verificar se existem dados para exportar
         if not simulation_results:
-            st.error("❌ Nenhum dado disponível para exportação")
+            st.error("❌ Nenhum dado de simulação disponível")
             return
-            
-        # Criar PDF
+
         pdf = FPDF()
-        pdf.add_page()
-        
-        # Cabeçalho
-        pdf.set_font('Arial', 'B', 16)
-        pdf.cell(0, 10, 'RELATÓRIO DE ANÁLISE DE RISCO - QUANTUM RISK ANALYTICS', 0, 1, 'C')
-        pdf.ln(5)
-        
-        # Data e informações básicas
-        pdf.set_font('Arial', '', 12)
-        pdf.cell(0, 10, f"Data: {datetime.now().strftime('%d/%m/%Y %H:%M')}", 0, 1)
-        pdf.cell(0, 10, f"Investimento Inicial: R$ {initial_investment:,.2f}", 0, 1)
-        pdf.ln(10)
-        
-        # Métricas principais
-        pdf.set_font('Arial', 'B', 14)
-        pdf.cell(0, 10, 'MÉTRICAS PRINCIPAIS', 0, 1)
-        pdf.ln(5)
-        
-        # ✅ CORREÇÃO: Tabela de métricas com verificação
-        pdf.set_font('Arial', 'B', 10)
-        pdf.cell(60, 10, 'Método', 1)
-        pdf.cell(30, 10, 'VaR (R$)', 1)
-        pdf.cell(30, 10, 'Prob. Prejuízo', 1)
-        pdf.cell(40, 10, 'Retorno Esperado (R$)', 1)
-        pdf.cell(30, 10, 'Simulações', 1)
-        pdf.ln()
-        
-        pdf.set_font('Arial', '', 10)
-        for method, results in simulation_results.items():
-            # ✅ CORREÇÃO: Verificar se as métricas existem
-            var_value = abs(results.get('var', 0))
-            prob_loss = results.get('probability_loss', 0)
-            expected_return = results.get('expected_return', 0)
-            simulations = results.get('simulations', 0)
-            
-            pdf.cell(60, 10, str(method), 1)
-            pdf.cell(30, 10, f"R$ {var_value:,.0f}", 1)
-            pdf.cell(30, 10, f"{prob_loss:.2%}", 1)
-            pdf.cell(40, 10, f"R$ {expected_return:,.0f}", 1)
-            pdf.cell(30, 10, f"{simulations:,}", 1)
+
+        def _header(pdf, title):
+            pdf.add_page()
+            pdf.set_font("Arial", "B", 14)
+            pdf.set_fill_color(26, 26, 46)
+            pdf.set_text_color(255, 255, 255)
+            pdf.cell(0, 12, title, 0, 1, "C", fill=True)
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(4)
+
+        def _section(pdf, title):
+            pdf.set_font("Arial", "B", 11)
+            pdf.set_fill_color(230, 230, 240)
+            pdf.cell(0, 8, title, 0, 1, "L", fill=True)
+            pdf.set_font("Arial", "", 10)
+            pdf.ln(2)
+
+        def _table_row(pdf, cells, widths, bold=False):
+            pdf.set_font("Arial", "B" if bold else "", 9)
+            for cell, w in zip(cells, widths):
+                pdf.cell(w, 7, str(cell), 1)
             pdf.ln()
-        
-        # Salvar PDF temporariamente
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            pdf.output(tmp_file.name)
-            
-            with open(tmp_file.name, 'rb') as f:
-                pdf_data = f.read()
-        
-        # ✅ CORREÇÃO: Botão de download com key única
+
+        # ── Capa ──────────────────────────────────────────────────────────────
+        pdf.add_page()
+        pdf.set_font("Arial", "B", 20)
+        pdf.ln(30)
+        pdf.cell(0, 14, "QUANTUM RISK ANALYTICS", 0, 1, "C")
+        pdf.set_font("Arial", "B", 14)
+        pdf.cell(0, 10, "Relatório Consolidado de Análise de Risco", 0, 1, "C")
+        pdf.ln(10)
+        pdf.set_font("Arial", "", 12)
+        pdf.cell(0, 8, f"Data: {datetime.now().strftime('%d/%m/%Y  %H:%M')}", 0, 1, "C")
+        pdf.cell(0, 8, f"Investimento inicial: R$ {initial_investment:,.2f}", 0, 1, "C")
+
+        # ── Seção 1: Simulações ───────────────────────────────────────────────
+        _header(pdf, "1. SIMULAÇÕES DE MONTE CARLO")
+        _section(pdf, "Métricas por método de simulação")
+        cols = ["Método", "VaR (R$)", "CVaR (R$)", "Prob. Perd.", "Ret. Esp. (R$)", "Simulações"]
+        widths = [52, 28, 28, 22, 36, 24]
+        _table_row(pdf, cols, widths, bold=True)
+        for method, r in simulation_results.items():
+            _table_row(pdf, [
+                method[:30],
+                f"R$ {abs(r.get('var', 0)):,.0f}",
+                f"R$ {abs(r.get('cvar', 0)):,.0f}",
+                f"{r.get('probability_loss', 0):.1%}",
+                f"R$ {r.get('expected_return', 0):,.0f}",
+                f"{r.get('simulations', 0):,}",
+            ], widths)
+
+        # ── Seção 2: Métricas por ativo ───────────────────────────────────────
+        orch = st.session_state.get("orchestrator")
+        report = st.session_state.get("analysis_report") or st.session_state.get("report")
+        returns_df = st.session_state.get("returns_filtered") or st.session_state.get("returns")
+
+        if returns_df is not None and not returns_df.empty:
+            _header(pdf, "2. MÉTRICAS POR ATIVO")
+            _section(pdf, "Retorno anual, volatilidade, Sharpe, Max DD, VaR, CVaR")
+            cols2 = ["Ativo", "Ret. Anual", "Volat.", "Sharpe", "Max DD", "VaR 95%", "CVaR 95%"]
+            widths2 = [40, 22, 18, 18, 18, 22, 22]
+            _table_row(pdf, cols2, widths2, bold=True)
+            rf = st.session_state.get("risk_free_rate", 0.1075)
+            cl = st.session_state.get("confidence_level", 0.95)
+            for asset in returns_df.columns:
+                s = returns_df[asset].dropna()
+                ann_ret = s.mean() * 252
+                ann_vol = s.std() * np.sqrt(252)
+                sharpe = (ann_ret - rf) / ann_vol if ann_vol > 0 else 0
+                cum = (1 + s).cumprod()
+                mdd = ((cum - cum.expanding().max()) / cum.expanding().max()).min()
+                var = np.percentile(s, (1 - cl) * 100)
+                cvar = s[s <= var].mean()
+                _table_row(pdf, [asset, f"{ann_ret:.1%}", f"{ann_vol:.1%}", f"{sharpe:.2f}",
+                                  f"{mdd:.1%}", f"{var:.2%}", f"{cvar:.2%}"], widths2)
+
+        # ── Seção 3: Alertas ──────────────────────────────────────────────────
+        all_alerts = []
+        if report and "all_alerts" in report:
+            all_alerts = report["all_alerts"]
+        if all_alerts:
+            _header(pdf, "3. ALERTAS ATIVOS")
+            sev_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+            sorted_alerts = sorted(all_alerts, key=lambda x: sev_order.get(x.get("severity", "low"), 0), reverse=True)
+            _section(pdf, f"Total: {len(sorted_alerts)} alertas")
+            cols3 = ["Severidade", "Agente", "Score", "Mensagem"]
+            widths3 = [22, 35, 15, 118]
+            _table_row(pdf, cols3, widths3, bold=True)
+            for a in sorted_alerts[:30]:  # limite p/ não explodir o PDF
+                msg = str(a.get("message", ""))[:80]
+                _table_row(pdf, [
+                    a.get("severity", "").upper()[:10],
+                    a.get("agent_id", "")[:20],
+                    f"{a.get('score', 0):.2f}",
+                    msg,
+                ], widths3)
+            if len(sorted_alerts) > 30:
+                pdf.set_font("Arial", "I", 9)
+                pdf.cell(0, 6, f"... e mais {len(sorted_alerts) - 30} alertas (veja exportação Excel).", 0, 1)
+
+        # ── Seção 4: LSTM ─────────────────────────────────────────────────────
+        lstm_res = {}
+        if orch and hasattr(orch, "agent_lstm") and orch.agent_lstm:
+            lstm_res = getattr(orch.agent_lstm, "lstm_results", {}) or {}
+        if lstm_res:
+            _header(pdf, "4. LSTM — PREVISÃO DE TENDÊNCIA")
+            _section(pdf, "Resumo por ativo")
+            cols4 = ["Ativo", "Tendência", "Média/dia", "MAE", "d+1", "d+2", "d+3", "d+4", "d+5"]
+            widths4 = [30, 20, 20, 18, 18, 18, 18, 18, 20]
+            _table_row(pdf, cols4, widths4, bold=True)
+            for _a, _r in lstm_res.items():
+                fc = _r.get("forecast", [None]*5)
+                _table_row(pdf, [
+                    _a[:18],
+                    _r.get("trend", "").upper(),
+                    f"{_r.get('trend_avg', 0):+.3%}",
+                    f"{_r.get('mae', 0):.4f}",
+                    f"{fc[0]:.3%}" if len(fc) > 0 and fc[0] is not None else "-",
+                    f"{fc[1]:.3%}" if len(fc) > 1 and fc[1] is not None else "-",
+                    f"{fc[2]:.3%}" if len(fc) > 2 and fc[2] is not None else "-",
+                    f"{fc[3]:.3%}" if len(fc) > 3 and fc[3] is not None else "-",
+                    f"{fc[4]:.3%}" if len(fc) > 4 and fc[4] is not None else "-",
+                ], widths4)
+
+        # ── Seção 5: Autoencoder ──────────────────────────────────────────────
+        ae_res = {}
+        if orch and hasattr(orch, "agent_autoencoder") and orch.agent_autoencoder:
+            ae_res = getattr(orch.agent_autoencoder, "autoencoder_results", {}) or {}
+        if ae_res:
+            _header(pdf, "5. AUTOENCODER — DETECÇÃO DE ANOMALIAS")
+            _section(pdf, "Resumo")
+            pdf.set_font("Arial", "", 10)
+            pdf.cell(0, 7, f"Anomalias detectadas: {ae_res.get('n_anomalies', 0)}", 0, 1)
+            pdf.cell(0, 7, f"Anomalias últimos 5 dias: {ae_res.get('recent_anomalies', 0)}", 0, 1)
+            pdf.cell(0, 7, f"Taxa de anomalia: {ae_res.get('contamination', 0):.2%}", 0, 1)
+            pdf.cell(0, 7, f"Threshold MSE: {ae_res.get('threshold', 0):.6f}", 0, 1)
+            if "errors_by_asset" in ae_res:
+                pdf.ln(3)
+                _section(pdf, "Erro de reconstrução por ativo")
+                cols5 = ["Ativo", "MSE Médio", "Anômalo?"]
+                widths5 = [60, 40, 40]
+                _table_row(pdf, cols5, widths5, bold=True)
+                mean_err = np.mean(list(ae_res["errors_by_asset"].values()))
+                for asset, err in ae_res["errors_by_asset"].items():
+                    _table_row(pdf, [asset, f"{err:.6f}", "SIM" if err > 2 * mean_err else "NÃO"], widths5)
+
+        # ── Gerar e disponibilizar ─────────────────────────────────────────────
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            pdf.output(tmp.name)
+            pdf_data = open(tmp.name, "rb").read()
+        os.unlink(tmp.name)
+
         st.download_button(
-            label="⬇️ Baixar Relatório PDF",
+            label="⬇️ Baixar Relatório Consolidado (PDF)",
             data=pdf_data,
-            file_name=f"relatorio_risco_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+            file_name=f"relatorio_consolidado_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
             mime="application/pdf",
-            key="pdf_export_button"  # ✅ KEY ÚNICA
+            key="pdf_export_button",
         )
-        
-        # Limpar arquivo temporário
-        os.unlink(tmp_file.name)
-        
+
     except Exception as e:
         st.error(f"❌ Erro ao gerar PDF: {e}")
 
@@ -990,6 +1228,26 @@ def display_all_alerts_with_filters(report):
             with st.expander(f"{severity_display[severity]} ({len(alerts)} alertas)", expanded=severity in ['critical', 'high']):
                 for alert in alerts:
                     display_single_alert(alert)
+
+    # Exportar alertas
+    st.markdown("---")
+    _al_buf = BytesIO()
+    _al_rows = [{
+        "Severidade": a.get("severity", ""),
+        "Agente": a.get("agent_id", ""),
+        "Mensagem": a.get("message", ""),
+        "Score": a.get("score", ""),
+        "Timestamp": str(a.get("timestamp", "")),
+    } for a in all_alerts]
+    pd.DataFrame(_al_rows).to_excel(_al_buf, index=False, engine="xlsxwriter")
+    _al_buf.seek(0)
+    st.download_button(
+        "⬇️ Exportar Alertas (Excel)",
+        data=_al_buf,
+        file_name=f"alertas_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_alerts_excel",
+    )
 
 def display_single_alert(alert):
     """Exibe um único alerta de forma organizada"""
@@ -2396,6 +2654,7 @@ with tab1:
                 legend=dict(bgcolor='rgba(0,0,0,0)')
             )
             st.plotly_chart(fig_prices, use_container_width=True)
+            _dl_chart_btn("⬇️ Preços (HTML)", fig_prices, "precos_normalizados", "dl_prices", use_container_width=True)
 
         with col2:
             st.subheader("📈 Retornos Acumulados")
@@ -2418,27 +2677,68 @@ with tab1:
                 yaxis=dict(gridcolor='#333')
             )
             st.plotly_chart(fig_cumulative, use_container_width=True)
+            _dl_chart_btn("⬇️ Retornos Acumulados (HTML)", fig_cumulative, "retornos_acumulados", "dl_cumulative", use_container_width=True)
 
 with tab2:
     st.markdown('<div class="section-header">🤖 Sistema Multiagente Quantitativo</div>', unsafe_allow_html=True)
 
     # ── Seleção de agentes ────────────────────────────────────────────────────
     _ALL_AGENTS = {
-        "AgentMarket":      "📈 Market — volatilidade, correlação, regime",
-        "AgentClustering":  "🎯 Clustering — K-Means + PCA por similaridade",
-        "AgentML":          "🤖 ML — Isolation Forest + Random Forest",
-        "AgentSimulation":  "🎲 Simulation — Monte Carlo / Bootstrap / GARCH",
-        "AgentLSTM":        "🧠 LSTM — previsão de tendência (MLP temporal)",
-        "AgentAutoencoder": "🔬 Autoencoder — detecção de anomalias",
+        # label, perfis sugeridos
+        "AgentMarket":          ("📈 Market — volatilidade, correlação, regime",         ["quant", "credito", "tesoureiro", "research"]),
+        "AgentClustering":      ("🎯 Clustering — K-Means + PCA por similaridade",      ["quant"]),
+        "AgentML":              ("🤖 ML — Isolation Forest + Random Forest",             ["quant", "credito"]),
+        "AgentSimulation":      ("🎲 Simulation — Monte Carlo / Bootstrap / GARCH",      ["quant", "tesoureiro"]),
+        "AgentLSTM":            ("🧠 LSTM — previsão de tendência (MLP temporal)",       ["quant", "research"]),
+        "AgentAutoencoder":     ("🔬 Autoencoder — detecção de anomalias",               ["quant"]),
+        "AgentFundamental":     ("📊 Fundamental — P/E, P/B, EV/EBITDA, DCF",           ["research"]),
+        "AgentCredit":          ("🏦 Credit — Dív.Líq/EBITDA, ICR, Liquidez, FCF",      ["credito"]),
+        "AgentDividend":        ("💰 Dividend — DY, payout, consistência, CAGR 5Y",      ["research"]),
+        "AgentPeerComparison":  ("🔁 Peer — ranking relativo por setor (z-score)",       ["research"]),
+        "AgentMacroSensitivity":("🏛️ Macro — beta a CDI, IPCA, câmbio (rolling OLS)",   ["tesoureiro", "credito"]),
+        "AgentScenario":        ("⚡ Cenário — stress SELIC+300bps / IPCA+4% / FX+20%", ["tesoureiro", "credito"]),
+    }
+
+    # Perfis de sugestão (não restritivo — apenas pré-marca checkboxes)
+    _PROFILES = {
+        "Todos":                None,
+        "📊 Research (Equity)": ["AgentFundamental", "AgentDividend", "AgentPeerComparison", "AgentMarket", "AgentLSTM"],
+        "🏦 Crédito":           ["AgentCredit", "AgentScenario", "AgentMacroSensitivity", "AgentMarket", "AgentML"],
+        "🏛️ Tesoureiro":        ["AgentMacroSensitivity", "AgentScenario", "AgentSimulation", "AgentMarket"],
+        "🔍 Quant / Risco":     ["AgentMarket", "AgentML", "AgentSimulation", "AgentLSTM", "AgentAutoencoder", "AgentClustering"],
     }
 
     with st.expander("⚙️ Selecionar agentes para executar", expanded=False):
+        # Seletor de perfil
+        _profile_key = st.selectbox(
+            "Sugestão por perfil (não restringe seleção):",
+            list(_PROFILES.keys()),
+            key="agent_profile_sel",
+            help="Selecionar um perfil pré-marca os agentes mais relevantes, mas você pode ajustar livremente.",
+        )
+        _profile_suggestion = _PROFILES[_profile_key]
+
+        if _profile_suggestion is not None and st.button("Aplicar sugestão de perfil", key="apply_profile"):
+            for k in _ALL_AGENTS:
+                st.session_state[f"agent_chk_{k}"] = k in _profile_suggestion
+
+        st.caption("Todos os agentes podem ser usados independentemente do perfil.")
+        st.markdown("---")
+
         _sel_cols = st.columns(2)
         _agent_enabled = {}
-        for _i, (_key, _label) in enumerate(_ALL_AGENTS.items()):
+        for _i, (_key, (_label, _profiles)) in enumerate(_ALL_AGENTS.items()):
+            # badge de perfis sugeridos
+            _badge = " ".join(
+                {"research": "📊", "credito": "🏦", "tesoureiro": "🏛️", "quant": "🔍"}.get(p, "") for p in _profiles
+            ).strip()
+            _display = f"{_label}  {_badge}" if _badge else _label
             with _sel_cols[_i % 2]:
+                _default = True if _profile_suggestion is None else (_key in _profile_suggestion)
                 _agent_enabled[_key] = st.checkbox(
-                    _label, value=True, key=f"agent_chk_{_key}"
+                    _display,
+                    value=st.session_state.get(f"agent_chk_{_key}", _default),
+                    key=f"agent_chk_{_key}",
                 )
         _agents_to_run = [k for k, v in _agent_enabled.items() if v]
         if not _agents_to_run:
@@ -2457,8 +2757,16 @@ with tab2:
             if st.session_state.orchestrator:
                 with st.spinner(f"🤖 Executando {_n_sel} agente(s)..."):
                     try:
+                        _agent_portfolio_config = {
+                            "macro_df":   macro_df if not macro_df.empty else None,
+                            "value":      st.session_state.get("initial_investment", 100_000),
+                            "weights":    {tk: 1.0 / len(prices_filtered.columns)
+                                           for tk in prices_filtered.columns},
+                            "confidence_level": st.session_state.get("confidence_level", 0.95),
+                        }
                         alerts = st.session_state.orchestrator.run_analysis(
                             prices_filtered,
+                            portfolio_config=_agent_portfolio_config,
                             enabled_agents=_agents_to_run if _n_sel < len(_ALL_AGENTS) else None,
                         )
                         report = st.session_state.orchestrator.generate_report(alerts)
@@ -2481,8 +2789,11 @@ with tab2:
     
     # Exibir resultados se disponíveis
     if hasattr(st.session_state, 'last_agent_report'):
-        tab_alertas, tab_analytics, tab_lstm, tab_ae = st.tabs([
-            "🚨 Alertas", "📊 Analytics", "🧠 LSTM", "🔬 Autoencoder"
+        (tab_alertas, tab_analytics, tab_lstm, tab_ae,
+         tab_fund, tab_credit, tab_div, tab_peer, tab_macro, tab_scenario) = st.tabs([
+            "🚨 Alertas", "📊 Analytics", "🧠 LSTM", "🔬 Autoencoder",
+            "📊 Fundamentals", "🏦 Crédito",
+            "💰 Dividendos", "🔁 Peer", "🏛️ Macro", "⚡ Cenários",
         ])
 
         with tab_alertas:
@@ -2568,6 +2879,40 @@ with tab2:
                 )
                 st.plotly_chart(_fig_lstm, use_container_width=True)
                 st.caption(f"MAE no conjunto de teste: **{_r['mae']:.4f}** ({_r['test_size']} dias)")
+                _dl_chart_btn("⬇️ Gráfico LSTM (HTML)", _fig_lstm, f"lstm_{_sel}", "dl_lstm_chart")
+
+                # Excel: todos os ativos LSTM
+                _lstm_buf = BytesIO()
+                with pd.ExcelWriter(_lstm_buf, engine="xlsxwriter") as _lw:
+                    # Resumo: tendência por ativo
+                    _summary = [{
+                        "Ativo": _a,
+                        "Tendência": _lstm_res[_a]["trend"],
+                        "Média/dia (%)": _lstm_res[_a]["trend_avg"],
+                        "MAE": _lstm_res[_a]["mae"],
+                        "Dias de teste": _lstm_res[_a]["test_size"],
+                        "Forecast d+1": _lstm_res[_a]["forecast"][0] if _lstm_res[_a]["forecast"] else None,
+                        "Forecast d+2": _lstm_res[_a]["forecast"][1] if len(_lstm_res[_a]["forecast"]) > 1 else None,
+                        "Forecast d+3": _lstm_res[_a]["forecast"][2] if len(_lstm_res[_a]["forecast"]) > 2 else None,
+                        "Forecast d+4": _lstm_res[_a]["forecast"][3] if len(_lstm_res[_a]["forecast"]) > 3 else None,
+                        "Forecast d+5": _lstm_res[_a]["forecast"][4] if len(_lstm_res[_a]["forecast"]) > 4 else None,
+                    } for _a in _lstm_res]
+                    pd.DataFrame(_summary).to_excel(_lw, sheet_name="Resumo LSTM", index=False)
+                    # Série temporal por ativo
+                    for _a, _ar in _lstm_res.items():
+                        _n = min(len(_ar["actual"]), len(_ar["predicted"]))
+                        pd.DataFrame({
+                            "Real": _ar["actual"][:_n],
+                            "Previsto": _ar["predicted"][:_n],
+                        }).to_excel(_lw, sheet_name=(_a[:28] + "_lstm")[:31], index=False)
+                _lstm_buf.seek(0)
+                st.download_button(
+                    "⬇️ Dados LSTM (Excel — todos os ativos)",
+                    data=_lstm_buf,
+                    file_name=f"lstm_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_lstm_excel",
+                )
 
         # ── Autoencoder ───────────────────────────────────────────────────────
         with tab_ae:
@@ -2653,6 +2998,552 @@ with tab2:
                 )
                 st.plotly_chart(_fig_bar, use_container_width=True)
                 st.caption("Barras vermelhas = ativos com padrão de retorno mais atípico (MSE > 2× média).")
+
+                # Downloads Autoencoder
+                _dl_chart_btn("⬇️ Erro de Reconstrução (HTML)", _fig_ae, "autoencoder_erros", "dl_ae_chart")
+
+                _ae_buf = BytesIO()
+                with pd.ExcelWriter(_ae_buf, engine="xlsxwriter") as _aw:
+                    # Série temporal de erros
+                    pd.DataFrame({
+                        "Data": list(_ae_res["dates"]),
+                        "Erro MSE": list(_ae_res["errors"]),
+                        "Anomalia": [bool(b) for b in _ae_res["is_anomaly"]],
+                    }).to_excel(_aw, sheet_name="Erros Temporais", index=False)
+                    # Erro por ativo
+                    pd.DataFrame(
+                        list(_ae_res["errors_by_asset"].items()),
+                        columns=["Ativo", "MSE Médio"]
+                    ).to_excel(_aw, sheet_name="Erro por Ativo", index=False)
+                    # Resumo
+                    pd.DataFrame([{
+                        "N anomalias": _ae_res["n_anomalies"],
+                        "Anomalias últimos 5 dias": _ae_res["recent_anomalies"],
+                        "Taxa de anomalia": _ae_res["contamination"],
+                        "Threshold MSE": _ae_res["threshold"],
+                    }]).to_excel(_aw, sheet_name="Resumo", index=False)
+                _ae_buf.seek(0)
+                st.download_button(
+                    "⬇️ Dados Autoencoder (Excel)",
+                    data=_ae_buf,
+                    file_name=f"autoencoder_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_ae_excel",
+                )
+
+        # ── AgentFundamental ─────────────────────────────────────────────────
+        with tab_fund:
+            st.markdown("### 📊 Análise Fundamentalista")
+            st.caption("P/E, P/B, EV/EBITDA, margem EBITDA, crescimento de receita e DCF simplificado via yfinance.")
+            _orch = st.session_state.orchestrator
+            _fund_res = {}
+            if _orch and hasattr(_orch, "agent_fundamental"):
+                _fund_res = getattr(_orch.agent_fundamental, "fundamental_results", {}) or {}
+
+            if not _fund_res:
+                st.info("Execute a análise multiagente com **AgentFundamental** selecionado para ver os múltiplos.")
+            else:
+                # Tabela resumo de múltiplos
+                _fund_rows = []
+                for _tk, _fr in _fund_res.items():
+                    _fund_rows.append({
+                        "Ativo":            _fr.get("name", _tk),
+                        "Ticker":           _tk,
+                        "Setor":            _fr.get("sector", "N/D"),
+                        "P/E":              _fr.get("pe_ratio"),
+                        "P/B":              _fr.get("pb_ratio"),
+                        "EV/EBITDA":        _fr.get("ev_ebitda"),
+                        "Marg. EBITDA":     _fr.get("ebitda_margin"),
+                        "Cresc. Receita":   _fr.get("revenue_growth_yoy"),
+                        "DY":               _fr.get("dividend_yield"),
+                        "DCF Upside":       _fr.get("dcf_upside"),
+                        "Market Cap (R$M)": (_fr.get("market_cap") or 0) / 1e6,
+                    })
+                _fund_df = pd.DataFrame(_fund_rows).set_index("Ticker")
+
+                def _fmt_fund(df):
+                    fmt = {
+                        "P/E":            "{:.1f}",
+                        "P/B":            "{:.2f}",
+                        "EV/EBITDA":      "{:.1f}",
+                        "Marg. EBITDA":   "{:.1%}",
+                        "Cresc. Receita": "{:.1%}",
+                        "DY":             "{:.2%}",
+                        "DCF Upside":     "{:.1%}",
+                        "Market Cap (R$M)": "{:,.0f}",
+                    }
+                    styled = df.style
+                    for col, f in fmt.items():
+                        if col in df.columns:
+                            styled = styled.format(f, subset=[col], na_rep="N/D")
+                    if "DCF Upside" in df.columns:
+                        styled = styled.applymap(
+                            lambda v: "color: #2ecc71" if isinstance(v, float) and v > 0.10
+                            else ("color: #e74c3c" if isinstance(v, float) and v < -0.10 else ""),
+                            subset=["DCF Upside"],
+                        )
+                    return styled
+
+                st.dataframe(_fmt_fund(_fund_df), use_container_width=True)
+
+                # Gráficos
+                _valid = [r for r in _fund_rows if r.get("EV/EBITDA") is not None]
+                if _valid:
+                    _fc1, _fc2 = st.columns(2)
+                    with _fc1:
+                        _fig_pe = px.bar(
+                            pd.DataFrame(_valid),
+                            x="Ticker", y="EV/EBITDA",
+                            color="EV/EBITDA",
+                            color_continuous_scale="RdYlGn_r",
+                            title="EV/EBITDA por Ativo",
+                        )
+                        _fig_pe.update_layout(
+                            height=350, plot_bgcolor="rgba(0,0,0,0)",
+                            paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#f0f2f6"),
+                        )
+                        st.plotly_chart(_fig_pe, use_container_width=True)
+                        _dl_chart_btn("⬇️ EV/EBITDA (HTML)", _fig_pe, "ev_ebitda", "dl_ev_ebitda")
+
+                    with _fc2:
+                        _dcf_valid = [r for r in _fund_rows if r.get("DCF Upside") is not None]
+                        if _dcf_valid:
+                            _fig_dcf = px.bar(
+                                pd.DataFrame(_dcf_valid),
+                                x="Ticker", y="DCF Upside",
+                                color="DCF Upside",
+                                color_continuous_scale="RdYlGn",
+                                title="DCF Upside/Downside vs. Preço Atual",
+                            )
+                            _fig_dcf.update_layout(
+                                height=350, plot_bgcolor="rgba(0,0,0,0)",
+                                paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#f0f2f6"),
+                                yaxis=dict(tickformat=".0%"),
+                            )
+                            _fig_dcf.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5)
+                            st.plotly_chart(_fig_dcf, use_container_width=True)
+                            _dl_chart_btn("⬇️ DCF Upside (HTML)", _fig_dcf, "dcf_upside", "dl_dcf_upside")
+
+                # Excel export
+                _fund_buf = BytesIO()
+                with pd.ExcelWriter(_fund_buf, engine="xlsxwriter") as _fw:
+                    _fund_df.reset_index().to_excel(_fw, sheet_name="Múltiplos", index=False)
+                    # DCF detail
+                    _dcf_rows = [{
+                        "Ticker": _tk,
+                        "FCF": _fr.get("fcf"),
+                        "Market Cap": _fr.get("market_cap"),
+                        "DCF Value (WACC=12%, g=4%)": _fr.get("dcf_value"),
+                        "DCF Upside": _fr.get("dcf_upside"),
+                    } for _tk, _fr in _fund_res.items()]
+                    pd.DataFrame(_dcf_rows).to_excel(_fw, sheet_name="DCF", index=False)
+                _fund_buf.seek(0)
+                st.download_button(
+                    "⬇️ Fundamentals (Excel)",
+                    data=_fund_buf,
+                    file_name=f"fundamentals_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_fund_excel",
+                )
+                st.caption(
+                    "Cobertura via yfinance: excelente para PETR4.SA, VALE3.SA, ITUB4.SA etc. "
+                    "Small/mid caps B3 podem ter dados parciais."
+                )
+
+        # ── AgentCredit ──────────────────────────────────────────────────────
+        with tab_credit:
+            st.markdown("### 🏦 Análise de Crédito")
+            st.caption("Dívida Líq./EBITDA, ICR, Liquidez Corrente, FCF Yield e score proprietário (0–100).")
+            _credit_res = {}
+            if _orch and hasattr(_orch, "agent_credit"):
+                _credit_res = getattr(_orch.agent_credit, "credit_results", {}) or {}
+
+            if not _credit_res:
+                st.info("Execute a análise multiagente com **AgentCredit** selecionado para ver o score de crédito.")
+            else:
+                _credit_rows = []
+                for _tk, _cr in _credit_res.items():
+                    _credit_rows.append({
+                        "Ativo":             _cr.get("name", _tk),
+                        "Ticker":            _tk,
+                        "Setor":             _cr.get("sector", "N/D"),
+                        "Score (0-100)":     _cr.get("credit_score"),
+                        "Rating":            _cr.get("credit_rating", "N/D"),
+                        "Dív.Líq./EBITDA":   _cr.get("net_debt_ebitda"),
+                        "ICR (Cob.Juros)":   _cr.get("interest_coverage"),
+                        "Liquidez Corr.":    _cr.get("current_ratio"),
+                        "FCF Yield":         _cr.get("fcf_yield"),
+                    })
+                _credit_df = pd.DataFrame(_credit_rows).set_index("Ticker")
+
+                # Score cards no topo
+                _scored = [r for r in _credit_rows if r.get("Score (0-100)") is not None]
+                if _scored:
+                    _card_cols = st.columns(min(len(_scored), 4))
+                    _rating_color = {
+                        "BAIXO RISCO": "#2ecc71", "RISCO MODERADO": "#f39c12",
+                        "RISCO ELEVADO": "#e67e22", "ALTO RISCO": "#e74c3c",
+                    }
+                    for _ci, _cr_row in enumerate(_scored[:4]):
+                        with _card_cols[_ci % min(len(_scored), 4)]:
+                            _col = _rating_color.get(_cr_row["Rating"], "#aaa")
+                            st.markdown(
+                                f'<div style="border:2px solid {_col};border-radius:8px;'
+                                f'padding:10px;text-align:center;margin:4px 0">'
+                                f'<b>{_cr_row["Ativo"]}</b><br/>'
+                                f'<span style="font-size:1.6rem;font-weight:bold;color:{_col}">'
+                                f'{_cr_row["Score (0-100)"]:.0f}</span><br/>'
+                                f'<small style="color:{_col}">{_cr_row["Rating"]}</small>'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+                    st.markdown("---")
+
+                # Tabela formatada
+                def _fmt_credit(df):
+                    fmt = {
+                        "Score (0-100)": "{:.0f}",
+                        "Dív.Líq./EBITDA": "{:.2f}x",
+                        "ICR (Cob.Juros)": "{:.2f}x",
+                        "Liquidez Corr.": "{:.2f}x",
+                        "FCF Yield": "{:.2%}",
+                    }
+                    styled = df.style
+                    for col, f in fmt.items():
+                        if col in df.columns:
+                            styled = styled.format(f, subset=[col], na_rep="N/D")
+                    if "Score (0-100)" in df.columns:
+                        styled = styled.applymap(
+                            lambda v: (
+                                "background-color: rgba(46,204,113,0.2)" if isinstance(v, float) and v >= 70
+                                else "background-color: rgba(231,76,60,0.2)" if isinstance(v, float) and v < 40
+                                else ""
+                            ),
+                            subset=["Score (0-100)"],
+                        )
+                    return styled
+
+                st.dataframe(_fmt_credit(_credit_df), use_container_width=True)
+
+                # Gráfico de score
+                if _scored:
+                    _fig_score = px.bar(
+                        pd.DataFrame(_scored).sort_values("Score (0-100)"),
+                        x="Score (0-100)", y="Ticker",
+                        orientation="h",
+                        color="Score (0-100)",
+                        color_continuous_scale="RdYlGn",
+                        range_color=[0, 100],
+                        title="Score de Crédito por Ativo (0 = alto risco, 100 = baixo risco)",
+                        hover_data=["Rating", "Díd.Líq./EBITDA", "ICR (Cob.Juros)"] if "Díd.Líq./EBITDA" in pd.DataFrame(_scored).columns else ["Rating"],
+                    )
+                    _fig_score.add_vline(x=70, line_dash="dash", line_color="#2ecc71",
+                                         annotation_text="Baixo Risco")
+                    _fig_score.add_vline(x=40, line_dash="dash", line_color="#e74c3c",
+                                         annotation_text="Alto Risco")
+                    _fig_score.update_layout(
+                        height=max(300, len(_scored) * 55),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        font=dict(color="#f0f2f6"),
+                        xaxis=dict(range=[0, 100], gridcolor="#333"),
+                    )
+                    st.plotly_chart(_fig_score, use_container_width=True)
+                    _dl_chart_btn("⬇️ Score de Crédito (HTML)", _fig_score, "credit_score", "dl_credit_chart")
+
+                # Excel export
+                _cr_buf = BytesIO()
+                with pd.ExcelWriter(_cr_buf, engine="xlsxwriter") as _cw:
+                    _credit_df.reset_index().to_excel(_cw, sheet_name="Score de Crédito", index=False)
+                    # Score breakdown
+                    _bk_rows = [{
+                        "Ticker": _tk,
+                        "Score Total": _cr_d.get("credit_score"),
+                        "Rating": _cr_d.get("credit_rating"),
+                        **{f"Pts_{k}": v for k, v in (_cr_d.get("score_details") or {}).items()}
+                    } for _tk, _cr_d in _credit_res.items()]
+                    pd.DataFrame(_bk_rows).to_excel(_cw, sheet_name="Score Breakdown", index=False)
+                _cr_buf.seek(0)
+                st.download_button(
+                    "⬇️ Análise de Crédito (Excel)",
+                    data=_cr_buf,
+                    file_name=f"credito_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_credit_excel",
+                )
+
+        # ── AgentDividend ────────────────────────────────────────────────────
+        with tab_div:
+            st.markdown("### 💰 Análise de Dividendos")
+            st.caption("DY histórico, crescimento 5Y, payout ratio e consistência de pagamentos via yfinance.")
+            _orch = st.session_state.orchestrator
+            _div_res = getattr(getattr(_orch, "agent_dividend", None), "dividend_results", {}) or {}
+
+            if not _div_res:
+                st.info("Execute a análise com **AgentDividend** para ver o histórico de dividendos.")
+            else:
+                _div_rows = [{
+                    "Ticker":       _tk,
+                    "Nome":         _dr.get("name", _tk),
+                    "DY Trailing":  _dr.get("dy_trailing"),
+                    "CAGR 5Y":      _dr.get("dividend_cagr_5y"),
+                    "Consistência": _dr.get("consistency_score"),
+                    "Anos Pagando": _dr.get("years_paying"),
+                    "Payout Ratio": _dr.get("payout_ratio"),
+                    "Div. 12m":     _dr.get("trailing_dividends_1y"),
+                } for _tk, _dr in _div_res.items()]
+                _div_df = pd.DataFrame(_div_rows).set_index("Ticker")
+
+                st.dataframe(_div_df.style.format({
+                    "DY Trailing":  "{:.2%}", "CAGR 5Y": "{:.2%}",
+                    "Consistência": "{:.0%}", "Payout Ratio": "{:.2%}",
+                    "Div. 12m":     "{:.4f}",
+                }, na_rep="N/D"), use_container_width=True)
+
+                _dc1, _dc2 = st.columns(2)
+                _dy_valid = [r for r in _div_rows if r.get("DY Trailing") is not None]
+                if _dy_valid:
+                    with _dc1:
+                        _fig_dy = px.bar(pd.DataFrame(_dy_valid).sort_values("DY Trailing", ascending=False),
+                            x="Ticker", y="DY Trailing", color="DY Trailing",
+                            color_continuous_scale="RdYlGn", title="Dividend Yield por Ativo")
+                        _fig_dy.update_layout(height=350, yaxis=dict(tickformat=".1%"),
+                            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                            font=dict(color="#f0f2f6"))
+                        st.plotly_chart(_fig_dy, use_container_width=True)
+                        _dl_chart_btn("⬇️ DY (HTML)", _fig_dy, "dividend_yield", "dl_dy_chart")
+
+                _cagr_valid = [r for r in _div_rows if r.get("CAGR 5Y") is not None]
+                if _cagr_valid:
+                    with _dc2:
+                        _fig_cagr = px.bar(pd.DataFrame(_cagr_valid).sort_values("CAGR 5Y"),
+                            x="Ticker", y="CAGR 5Y", color="CAGR 5Y",
+                            color_continuous_scale="RdYlGn", title="Crescimento de Dividendos CAGR 5Y")
+                        _fig_cagr.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5)
+                        _fig_cagr.update_layout(height=350, yaxis=dict(tickformat=".1%"),
+                            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                            font=dict(color="#f0f2f6"))
+                        st.plotly_chart(_fig_cagr, use_container_width=True)
+                        _dl_chart_btn("⬇️ CAGR Dividendos (HTML)", _fig_cagr, "div_cagr", "dl_cagr_chart")
+
+                _div_buf = BytesIO()
+                pd.DataFrame(_div_rows).to_excel(_div_buf, index=False, engine="xlsxwriter")
+                _div_buf.seek(0)
+                st.download_button("⬇️ Dividendos (Excel)", _div_buf,
+                    f"dividendos_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_div_excel")
+
+        # ── AgentPeerComparison ──────────────────────────────────────────────
+        with tab_peer:
+            st.markdown("### 🔁 Comparação entre Pares (Peer Comparison)")
+            st.caption("Ranking relativo de múltiplos (P/E, P/B, EV/EBITDA, DY) por setor. Z-score > |2| indica outlier.")
+            _peer_res = getattr(getattr(_orch, "agent_peer", None), "peer_results", {}) or {}
+
+            if not _peer_res:
+                st.info("Execute a análise com **AgentPeerComparison** para ver o ranking setorial.")
+            else:
+                _comparison = _peer_res.get("comparison", {})
+                _ticker_info = _peer_res.get("ticker_info", {})
+                _metrics_lbl = {"pe": "P/E", "pb": "P/B", "ev_ebitda": "EV/EBITDA", "dy": "DY"}
+
+                for _sector, _comp in _comparison.items():
+                    if _comp.get("solo"):
+                        st.markdown(f"**{_sector}** — apenas 1 ativo, sem comparação possível.")
+                        continue
+                    with st.expander(f"**{_sector}** ({len(_comp['members'])} ativos)", expanded=True):
+                        _peer_rows = []
+                        for _tk in _comp["members"]:
+                            _row = {"Ticker": _tk, "Nome": _ticker_info.get(_tk, {}).get("name", _tk)}
+                            for _m, _lbl in _metrics_lbl.items():
+                                if _m in _comp:
+                                    _r = _comp[_m]["rankings"].get(_tk, {})
+                                    _row[f"{_lbl} Valor"] = _r.get("value")
+                                    _row[f"{_lbl} Z"]     = _r.get("zscore")
+                            _peer_rows.append(_row)
+
+                        _peer_tbl = pd.DataFrame(_peer_rows).set_index("Ticker")
+                        _z_cols = [c for c in _peer_tbl.columns if c.endswith(" Z")]
+
+                        def _color_z(v):
+                            if not isinstance(v, float): return ""
+                            if v > 1.5:  return "color: #e74c3c"
+                            if v < -1.5: return "color: #2ecc71"
+                            return ""
+
+                        styled = _peer_tbl.style.format("{:.2f}", na_rep="N/D")
+                        if _z_cols:
+                            styled = styled.applymap(_color_z, subset=_z_cols)
+                        st.dataframe(styled, use_container_width=True)
+
+                        # Radar de z-scores por ativo
+                        _radar_data = []
+                        for _m, _lbl in _metrics_lbl.items():
+                            if _m in _comp:
+                                for _tk, _r in _comp[_m]["rankings"].items():
+                                    _radar_data.append({"Métrica": _lbl, "Ticker": _tk, "Z-score": _r["zscore"]})
+                        if _radar_data:
+                            _fig_radar = px.bar(pd.DataFrame(_radar_data), x="Métrica", y="Z-score",
+                                color="Ticker", barmode="group",
+                                title=f"Z-score por Métrica — {_sector}",
+                                color_discrete_sequence=px.colors.qualitative.Set2)
+                            _fig_radar.add_hline(y=2,  line_dash="dash", line_color="red",   opacity=0.5)
+                            _fig_radar.add_hline(y=-2, line_dash="dash", line_color="green", opacity=0.5)
+                            _fig_radar.update_layout(height=320,
+                                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                                font=dict(color="#f0f2f6"))
+                            st.plotly_chart(_fig_radar, use_container_width=True)
+
+                _peer_buf = BytesIO()
+                with pd.ExcelWriter(_peer_buf, engine="xlsxwriter") as _pw:
+                    _all_peer_rows = []
+                    for _sector, _comp in _comparison.items():
+                        if _comp.get("solo"): continue
+                        for _tk in _comp["members"]:
+                            _row = {"Setor": _sector, "Ticker": _tk,
+                                    "Nome": _ticker_info.get(_tk, {}).get("name", _tk)}
+                            for _m, _lbl in _metrics_lbl.items():
+                                if _m in _comp:
+                                    _r = _comp[_m]["rankings"].get(_tk, {})
+                                    _row[f"{_lbl}"] = _r.get("value")
+                                    _row[f"{_lbl}_Zscore"] = _r.get("zscore")
+                                    _row[f"{_lbl}_Pct"] = _r.get("pct_rank")
+                            _all_peer_rows.append(_row)
+                    if _all_peer_rows:
+                        pd.DataFrame(_all_peer_rows).to_excel(_pw, sheet_name="Peer Comparison", index=False)
+                _peer_buf.seek(0)
+                st.download_button("⬇️ Peer Comparison (Excel)", _peer_buf,
+                    f"peer_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_peer_excel")
+
+        # ── AgentMacroSensitivity ────────────────────────────────────────────
+        with tab_macro:
+            st.markdown("### 🏛️ Sensibilidade Macroeconômica")
+            st.caption("Beta rolling 63d de cada ativo a CDI, IPCA e câmbio via regressão OLS histórica.")
+            _macro_res = getattr(getattr(_orch, "agent_macro", None), "macro_sensitivity_results", {}) or {}
+
+            if not _macro_res or not _macro_res.get("assets"):
+                st.info("Execute a análise com **AgentMacroSensitivity** para ver os betas macroeconômicos.")
+            else:
+                _factors  = _macro_res.get("factors", [])
+                _assets   = _macro_res.get("assets", {})
+
+                # Tabela de betas rolling
+                _beta_rows = []
+                for _tk, _fdata in _assets.items():
+                    _row = {"Ticker": _tk}
+                    for _f in _factors:
+                        _fd = _fdata.get(_f, {})
+                        _row[f"β {_f} (full)"]    = _fd.get("beta_full")
+                        _row[f"β {_f} (63d)"]     = _fd.get("beta_rolling_63d")
+                        _row[f"R² {_f}"]          = _fd.get("r2")
+                    _beta_rows.append(_row)
+
+                _beta_df = pd.DataFrame(_beta_rows).set_index("Ticker")
+                st.dataframe(_beta_df.style.format("{:.4f}", na_rep="N/D")
+                             .background_gradient(cmap="RdYlGn_r", subset=[c for c in _beta_df.columns if "β" in c]),
+                             use_container_width=True)
+
+                # Heatmap dos betas rolling
+                _hm_data = {_f: [_assets.get(_tk, {}).get(_f, {}).get("beta_rolling_63d", np.nan)
+                                  for _tk in _assets] for _f in _factors}
+                _hm_df = pd.DataFrame(_hm_data, index=list(_assets.keys()))
+                if not _hm_df.empty:
+                    _fig_hm = px.imshow(_hm_df, text_auto=".3f", aspect="auto",
+                        color_continuous_scale="RdBu_r", color_continuous_midpoint=0,
+                        title="Heatmap de Beta Rolling 63d (ativo × fator macro)")
+                    _fig_hm.update_layout(height=400, plot_bgcolor="rgba(0,0,0,0)",
+                        paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#f0f2f6"))
+                    st.plotly_chart(_fig_hm, use_container_width=True)
+                    _dl_chart_btn("⬇️ Heatmap Macro (HTML)", _fig_hm, "macro_heatmap", "dl_macro_hm")
+
+                _mac_buf = BytesIO()
+                _beta_df.reset_index().to_excel(_mac_buf, index=False, engine="xlsxwriter")
+                _mac_buf.seek(0)
+                st.download_button("⬇️ Betas Macro (Excel)", _mac_buf,
+                    f"macro_sensitivity_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_macro_excel")
+
+        # ── AgentScenario ────────────────────────────────────────────────────
+        with tab_scenario:
+            st.markdown("### ⚡ Stress Test — Análise de Cenários")
+            st.caption("Impacto estimado no portfólio sob choques de SELIC, IPCA e câmbio.")
+            _scen_res = getattr(getattr(_orch, "agent_scenario", None), "scenario_results", {}) or {}
+
+            if not _scen_res or not _scen_res.get("scenarios"):
+                st.info("Execute a análise com **AgentScenario** para ver o stress test.")
+            else:
+                _scenarios = _scen_res["scenarios"]
+                _port_val  = _scen_res.get("portfolio_value", 100_000)
+
+                # Cards de resumo por cenário
+                _scol = st.columns(len(_scenarios))
+                _sev_color = {"SEVERO": "#e74c3c", "MODERADO": "#e67e22",
+                              "LEVE": "#f1c40f", "POSITIVO": "#2ecc71"}
+                for _si, (_sn, _sd) in enumerate(_scenarios.items()):
+                    with _scol[_si]:
+                        _col = _sev_color.get(_sd["severity"], "#aaa")
+                        _pct = _sd["portfolio_impact_pct"]
+                        _brl = _sd["portfolio_impact_brl"]
+                        st.markdown(
+                            f'<div style="border:2px solid {_col};border-radius:8px;'
+                            f'padding:10px;text-align:center;margin:4px 0">'
+                            f'<b>{_sn}</b><br/>'
+                            f'<span style="font-size:1.4rem;font-weight:bold;color:{_col}">'
+                            f'{_pct:+.1%}</span><br/>'
+                            f'<small>R$ {_brl:+,.0f}</small><br/>'
+                            f'<small style="color:{_col}">{_sd["severity"]}</small>'
+                            f'</div>',
+                            unsafe_allow_html=True)
+
+                st.markdown("---")
+
+                # Gráfico de barras: impacto por cenário
+                _sc_rows = [{"Cenário": _sn, "Impacto (%)": _sd["portfolio_impact_pct"],
+                             "Severidade": _sd["severity"]}
+                            for _sn, _sd in _scenarios.items()]
+                _fig_sc = px.bar(pd.DataFrame(_sc_rows), x="Cenário", y="Impacto (%)",
+                    color="Impacto (%)", color_continuous_scale="RdYlGn",
+                    title=f"Impacto dos Cenários (portfólio R$ {_port_val:,.0f})")
+                _fig_sc.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5)
+                _fig_sc.update_layout(height=380, yaxis=dict(tickformat=".1%"),
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#f0f2f6"))
+                st.plotly_chart(_fig_sc, use_container_width=True)
+                _dl_chart_btn("⬇️ Stress Test (HTML)", _fig_sc, "stress_scenarios", "dl_scenario_chart")
+
+                # Tabela de impacto por ativo para o pior cenário
+                _worst_name = min(_scenarios, key=lambda k: _scenarios[k]["portfolio_impact_pct"])
+                _worst = _scenarios[_worst_name]
+                st.markdown(f"#### Impacto por ativo — pior cenário: *{_worst_name}*")
+                _asset_rows = [{"Ticker": _tk, "Impacto (%)": _imp}
+                               for _tk, _imp in _worst["asset_impacts"].items()]
+                _asset_df = pd.DataFrame(_asset_rows).sort_values("Impacto (%)").set_index("Ticker")
+                st.dataframe(_asset_df.style.format({"Impacto (%)": "{:.2%}"})
+                             .background_gradient(cmap="RdYlGn", subset=["Impacto (%)"]),
+                             use_container_width=True)
+
+                # Excel
+                _sc_buf = BytesIO()
+                with pd.ExcelWriter(_sc_buf, engine="xlsxwriter") as _sw:
+                    pd.DataFrame(_sc_rows).to_excel(_sw, sheet_name="Cenários", index=False)
+                    pd.DataFrame([
+                        {"Ticker": _tk, "Cenário": _sn, "Impacto (%)": _sd["asset_impacts"].get(_tk, 0)}
+                        for _sn, _sd in _scenarios.items()
+                        for _tk in _sd["asset_impacts"]
+                    ]).to_excel(_sw, sheet_name="Impacto por Ativo", index=False)
+                    pd.DataFrame([
+                        {"Ticker": _tk, "Fator": _f, "Beta": _b}
+                        for _tk, _fb in _scen_res.get("asset_betas", {}).items()
+                        for _f, _b in _fb.items()
+                    ]).to_excel(_sw, sheet_name="Betas Estimados", index=False)
+                _sc_buf.seek(0)
+                st.download_button("⬇️ Stress Test (Excel)", _sc_buf,
+                    f"stress_test_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_scenario_excel")
+
     else:
         st.info("""
         **👆 Execute a análise multiagente para ver os resultados**
@@ -2710,7 +3601,23 @@ with tab3:
             f'VaR {confidence_level:.0%}': '{:.2%}',
             f'CVaR {confidence_level:.0%}': '{:.2%}'
         }))
-    
+
+        # Excel: métricas por ativo + correlação
+        _met_buf = BytesIO()
+        with pd.ExcelWriter(_met_buf, engine="xlsxwriter") as _w:
+            metrics_df.reset_index().to_excel(_w, sheet_name="Métricas por Ativo", index=False)
+            returns_filtered.corr().to_excel(_w, sheet_name="Correlação")
+            returns_filtered.describe().to_excel(_w, sheet_name="Retornos Descritivos")
+        _met_buf.seek(0)
+        st.download_button(
+            "⬇️ Métricas por Ativo (Excel)",
+            data=_met_buf,
+            file_name=f"metricas_ativos_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_asset_metrics",
+            use_container_width=True,
+        )
+
     with col2:
         st.subheader("🔄 Matriz de Correlação")
         corr_matrix = returns_filtered.corr()
@@ -2729,7 +3636,8 @@ with tab3:
             font=dict(color='#f0f2f6', family='EB Garamond')
         )
         st.plotly_chart(fig_corr, use_container_width=True)
-    
+        _dl_chart_btn("⬇️ Correlação (HTML)", fig_corr, "correlacao", "dl_corr")
+
     # ✅ GRÁFICO DE DRAWDOWN READICIONADO
     st.subheader("📉 Análise de Drawdown do Portfólio")
     
@@ -2796,7 +3704,8 @@ with tab3:
     )
     
     st.plotly_chart(fig_drawdown, use_container_width=True)
-    
+    _dl_chart_btn("⬇️ Drawdown (HTML)", fig_drawdown, "drawdown", "dl_drawdown")
+
     # Métricas de drawdown
     col1, col2, col3, col4 = st.columns(4)
     

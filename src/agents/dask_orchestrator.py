@@ -1188,6 +1188,783 @@ class AgentAutoencoder(AgentBase):
             ))
         return alerts
 
+class AgentFundamental(AgentBase):
+    """Análise de múltiplos fundamentais (P/E, P/B, EV/EBITDA, DCF) via yfinance."""
+
+    def __init__(self):
+        super().__init__("AgentFundamental")
+        self.fundamental_results: Dict[str, Any] = {}
+
+    def _get_row(self, df: pd.DataFrame, keywords: List[str]) -> Optional[float]:
+        """Busca valor numa linha do DF pelo nome (tentativa exata, depois parcial)."""
+        if df is None or df.empty:
+            return None
+        kws = [k.lower() for k in keywords]
+        # exact match first
+        for idx in df.index:
+            if str(idx).lower() == " ".join(kws):
+                vals = df.loc[idx].dropna().values
+                return float(vals[0]) if len(vals) > 0 else None
+        # partial match — all keywords must appear
+        for idx in df.index:
+            idx_s = str(idx).lower()
+            if all(k in idx_s for k in kws):
+                vals = df.loc[idx].dropna().values
+                return float(vals[0]) if len(vals) > 0 else None
+        # fallback — any keyword
+        for k in kws:
+            for idx in df.index:
+                if k in str(idx).lower():
+                    vals = df.loc[idx].dropna().values
+                    return float(vals[0]) if len(vals) > 0 else None
+        return None
+
+    def _fetch(self, ticker: str) -> Optional[Dict]:
+        try:
+            import yfinance as yf
+            t = yf.Ticker(ticker)
+            info = t.info or {}
+            fin = pd.DataFrame() if info.get("quoteType") == "CRYPTOCURRENCY" else self._safe(t.financials)
+            bs  = self._safe(t.balance_sheet)
+            cf  = self._safe(t.cashflow)
+            return {"info": info, "fin": fin, "bs": bs, "cf": cf}
+        except Exception:
+            return None
+
+    def _safe(self, obj) -> pd.DataFrame:
+        try:
+            return obj if isinstance(obj, pd.DataFrame) and not obj.empty else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    def _compute(self, ticker: str, data: Dict) -> Dict:
+        info, fin, bs, cf = data["info"], data["fin"], data["bs"], data["cf"]
+        g = self._get_row
+
+        res: Dict[str, Any] = {
+            "ticker":   ticker,
+            "name":     info.get("shortName") or info.get("longName", ticker),
+            "sector":   info.get("sector", "N/D"),
+            "industry": info.get("industry", "N/D"),
+            # --- direct from info ---
+            "pe_ratio":        info.get("trailingPE") or info.get("forwardPE"),
+            "pb_ratio":        info.get("priceToBook"),
+            "ev_ebitda":       info.get("enterpriseToEbitda"),
+            "market_cap":      info.get("marketCap"),
+            "enterprise_value":info.get("enterpriseValue"),
+            "current_price":   info.get("currentPrice") or info.get("regularMarketPrice"),
+            "dividend_yield":  info.get("dividendYield"),
+        }
+
+        # --- revenue growth YoY ---
+        rev = g(fin, ["Total Revenue"])
+        if rev is None:
+            rev = g(fin, ["Revenue"])
+        # get 2 periods for growth
+        if fin is not None and not fin.empty:
+            rev_row = None
+            for idx in fin.index:
+                if "revenue" in str(idx).lower():
+                    vals = fin.loc[idx].dropna().values
+                    if len(vals) >= 2:
+                        rev_row = vals
+                    break
+            if rev_row is not None and rev_row[1] != 0:
+                res["revenue_growth_yoy"] = (rev_row[0] - rev_row[1]) / abs(rev_row[1])
+            else:
+                res["revenue_growth_yoy"] = None
+        else:
+            res["revenue_growth_yoy"] = None
+
+        # --- EBITDA & margin ---
+        ebitda = g(fin, ["EBITDA"])
+        if ebitda is None:
+            ebit = g(fin, ["EBIT"]) or g(fin, ["Operating Income"])
+            da   = g(cf, ["Depreciation"]) or g(fin, ["Reconciled Depreciation"])
+            if ebit is not None and da is not None:
+                ebitda = ebit + abs(da)
+        res["ebitda"] = ebitda
+
+        revenue = g(fin, ["Total Revenue"]) or g(fin, ["Revenue"])
+        res["ebitda_margin"] = (ebitda / revenue) if (ebitda and revenue and revenue != 0) else None
+
+        # --- FCF ---
+        fcf = g(cf, ["Free Cash Flow"])
+        if fcf is None:
+            ocf   = g(cf, ["Operating Cash Flow"]) or g(cf, ["Total Cash From Operating Activities"])
+            capex = g(cf, ["Capital Expenditures"]) or g(cf, ["Capital Expenditure"])
+            if ocf is not None and capex is not None:
+                fcf = ocf - abs(capex)
+        res["fcf"] = fcf
+
+        # --- DCF simplificado (Gordon Growth Model) ---
+        # WACC estimado: 12% (Brasil), g terminal: 4%
+        WACC, g_term = 0.12, 0.04
+        mc = res["market_cap"]
+        if fcf and fcf > 0 and mc and mc > 0:
+            dcf_val = fcf * (1 + g_term) / (WACC - g_term)
+            res["dcf_value"]  = dcf_val
+            res["dcf_upside"] = (dcf_val - mc) / mc
+        else:
+            res["dcf_value"]  = None
+            res["dcf_upside"] = None
+
+        return res
+
+    def process_data(self, market_data: pd.DataFrame,
+                     portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        alerts = []
+        self.fundamental_results = {}
+
+        skip = ("^", "BRL", "=X", "USDBRL")
+        tickers = [c for c in market_data.columns if not any(c.startswith(p) for p in skip)]
+
+        for ticker in tickers:
+            try:
+                raw = self._fetch(ticker)
+                if not raw or not raw["info"]:
+                    continue
+                r = self._compute(ticker, raw)
+                self.fundamental_results[ticker] = r
+
+                pe       = r.get("pe_ratio")
+                ev_ebitda = r.get("ev_ebitda")
+                dcf_up   = r.get("dcf_upside")
+                rev_g    = r.get("revenue_growth_yoy")
+
+                if pe and pe > 40:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: P/E elevado ({pe:.1f}x) — possível sobrevalorização",
+                        "medium", {"ticker": ticker, "pe_ratio": pe}))
+                if ev_ebitda and ev_ebitda > 15:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: EV/EBITDA elevado ({ev_ebitda:.1f}x)",
+                        "medium", {"ticker": ticker, "ev_ebitda": ev_ebitda}))
+                if dcf_up is not None and dcf_up < -0.30:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: DCF sugere sobrevalorização de {dcf_up:.1%}",
+                        "high", {"ticker": ticker, "dcf_upside": dcf_up}))
+                if rev_g is not None and rev_g < -0.10:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: Queda de receita YoY de {rev_g:.1%}",
+                        "high", {"ticker": ticker, "revenue_growth_yoy": rev_g}))
+            except Exception as e:
+                alerts.append(self.generate_alert(
+                    f"Erro em AgentFundamental para {ticker}: {e}", "low",
+                    {"ticker": ticker, "error": str(e)}))
+
+        n = len(self.fundamental_results)
+        alerts.append(self.generate_alert(
+            f"AgentFundamental: {n} ativo(s) analisado(s)" if n else
+            "AgentFundamental: sem dados — cobertura limitada para B3 small/mid caps",
+            "low" if n else "medium",
+            {"tickers": list(self.fundamental_results.keys())}))
+        return alerts
+
+
+class AgentCredit(AgentBase):
+    """Score proprietário de crédito: Dívida Liq./EBITDA, ICR, Liquidez, FCF Yield."""
+
+    def __init__(self):
+        super().__init__("AgentCredit")
+        self.credit_results: Dict[str, Any] = {}
+
+    def _get_row(self, df: pd.DataFrame, keywords: List[str]) -> Optional[float]:
+        if df is None or df.empty:
+            return None
+        kws = [k.lower() for k in keywords]
+        for idx in df.index:
+            idx_s = str(idx).lower()
+            if all(k in idx_s for k in kws):
+                vals = df.loc[idx].dropna().values
+                return float(vals[0]) if len(vals) > 0 else None
+        for k in kws:
+            for idx in df.index:
+                if k in str(idx).lower():
+                    vals = df.loc[idx].dropna().values
+                    return float(vals[0]) if len(vals) > 0 else None
+        return None
+
+    def _safe(self, obj) -> pd.DataFrame:
+        try:
+            return obj if isinstance(obj, pd.DataFrame) and not obj.empty else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    def _compute_credit(self, ticker: str) -> Optional[Dict]:
+        try:
+            import yfinance as yf
+            t    = yf.Ticker(ticker)
+            info = t.info or {}
+            bs   = self._safe(t.balance_sheet)
+            cf   = self._safe(t.cashflow)
+            fin  = self._safe(t.financials)
+            g    = self._get_row
+
+            res: Dict[str, Any] = {
+                "ticker": ticker,
+                "name":   info.get("shortName", ticker),
+                "sector": info.get("sector", "N/D"),
+            }
+
+            # Dívida total e caixa
+            total_debt = g(bs, ["Total Debt"]) or (
+                (g(bs, ["Long Term Debt"]) or 0) + (g(bs, ["Short Long Term Debt"]) or 0) or None)
+            cash = g(bs, ["Cash And Cash Equivalents"]) or g(bs, ["Cash"])
+
+            # EBITDA
+            ebitda = g(fin, ["EBITDA"])
+            if ebitda is None:
+                ebit = g(fin, ["EBIT"]) or g(fin, ["Operating Income"])
+                da   = g(cf, ["Depreciation"])
+                if ebit is not None and da is not None:
+                    ebitda = ebit + abs(da)
+
+            # Dívida Líquida / EBITDA
+            if total_debt is not None and cash is not None and ebitda and ebitda != 0:
+                net_debt = total_debt - cash
+                res["net_debt"]        = net_debt
+                res["net_debt_ebitda"] = net_debt / ebitda
+            else:
+                res["net_debt"]        = None
+                res["net_debt_ebitda"] = None
+
+            # ICR: EBIT / Despesa Financeira
+            ebit     = g(fin, ["EBIT"]) or g(fin, ["Operating Income"])
+            int_exp  = g(fin, ["Interest Expense"])
+            if ebit is not None and int_exp and int_exp != 0:
+                res["interest_coverage"] = ebit / abs(int_exp)
+            else:
+                res["interest_coverage"] = None
+
+            # Liquidez Corrente
+            cur_assets = g(bs, ["Current Assets"]) or g(bs, ["Total Current Assets"])
+            cur_liab   = g(bs, ["Current Liabilities"]) or g(bs, ["Total Current Liabilities"])
+            res["current_ratio"] = (cur_assets / cur_liab) if (cur_assets and cur_liab and cur_liab != 0) else None
+
+            # FCF Yield
+            ocf   = g(cf, ["Operating Cash Flow"]) or g(cf, ["Total Cash From Operating Activities"])
+            capex = g(cf, ["Capital Expenditures"]) or g(cf, ["Capital Expenditure"])
+            mc    = info.get("marketCap")
+            if ocf and capex is not None and mc and mc > 0:
+                fcf = ocf - abs(capex)
+                res["fcf"]       = fcf
+                res["fcf_yield"] = fcf / mc
+            else:
+                res["fcf"]       = None
+                res["fcf_yield"] = None
+
+            # ── Score proprietário (0–100) ──────────────────────────────────
+            score = 50
+            details: Dict[str, int] = {}
+
+            nd = res.get("net_debt_ebitda")
+            if nd is not None:
+                s = 25 if nd < 1 else 15 if nd < 2 else 5 if nd < 3 else 0 if nd < 4 else -20
+                score += s; details["net_debt_ebitda"] = s
+
+            icr = res.get("interest_coverage")
+            if icr is not None:
+                s = 20 if icr > 5 else 10 if icr > 3 else 0 if icr > 1.5 else -20
+                score += s; details["interest_coverage"] = s
+
+            cr = res.get("current_ratio")
+            if cr is not None:
+                s = 10 if cr > 2 else 5 if cr > 1.5 else 0 if cr > 1 else -15
+                score += s; details["current_ratio"] = s
+
+            fy = res.get("fcf_yield")
+            if fy is not None:
+                s = 10 if fy > 0.08 else 5 if fy > 0.04 else 0 if fy > 0 else -15
+                score += s; details["fcf_yield"] = s
+
+            score = max(0, min(100, score))
+            res["credit_score"]   = score
+            res["score_details"]  = details
+            res["credit_rating"]  = (
+                "BAIXO RISCO"    if score >= 70 else
+                "RISCO MODERADO" if score >= 50 else
+                "RISCO ELEVADO"  if score >= 30 else
+                "ALTO RISCO"
+            )
+            return res
+
+        except Exception as e:
+            return {"ticker": ticker, "error": str(e), "credit_score": None, "credit_rating": "N/D"}
+
+    def process_data(self, market_data: pd.DataFrame,
+                     portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        alerts = []
+        self.credit_results = {}
+
+        skip = ("^", "BRL", "=X", "USDBRL")
+        tickers = [c for c in market_data.columns if not any(c.startswith(p) for p in skip)]
+
+        for ticker in tickers:
+            try:
+                r = self._compute_credit(ticker)
+                if not r:
+                    continue
+                self.credit_results[ticker] = r
+
+                score     = r.get("credit_score")
+                nd_ebitda = r.get("net_debt_ebitda")
+                icr       = r.get("interest_coverage")
+                cr        = r.get("current_ratio")
+
+                if score is not None:
+                    if score < 30:
+                        alerts.append(self.generate_alert(
+                            f"{ticker}: ALTO RISCO de crédito — score {score:.0f}/100",
+                            "critical", r))
+                    elif score < 50:
+                        alerts.append(self.generate_alert(
+                            f"{ticker}: Risco elevado de crédito — score {score:.0f}/100",
+                            "high", r))
+
+                if nd_ebitda is not None and nd_ebitda > 4:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: Alavancagem crítica — Dív. Líq./EBITDA = {nd_ebitda:.1f}x",
+                        "critical", {"ticker": ticker, "net_debt_ebitda": nd_ebitda}))
+                if icr is not None and icr < 1.5:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: Cobertura de juros insuficiente — ICR = {icr:.1f}x",
+                        "high", {"ticker": ticker, "interest_coverage": icr}))
+                if cr is not None and cr < 1.0:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: Liquidez corrente abaixo de 1,0 ({cr:.2f}x)",
+                        "high", {"ticker": ticker, "current_ratio": cr}))
+
+            except Exception as e:
+                alerts.append(self.generate_alert(
+                    f"Erro em AgentCredit para {ticker}: {e}", "low",
+                    {"ticker": ticker, "error": str(e)}))
+
+        scored = [v for v in self.credit_results.values() if v.get("credit_score") is not None]
+        if scored:
+            avg = np.mean([v["credit_score"] for v in scored])
+            sev = "high" if avg < 40 else "medium" if avg < 60 else "low"
+            alerts.append(self.generate_alert(
+                f"AgentCredit: {len(scored)} ativo(s), score médio {avg:.0f}/100",
+                sev, {"avg_credit_score": avg, "tickers": list(self.credit_results.keys())}))
+        else:
+            alerts.append(self.generate_alert(
+                "AgentCredit: sem dados de balanço disponíveis via yfinance",
+                "medium", {}))
+        return alerts
+
+
+class AgentDividend(AgentBase):
+    """DY histórico, payout ratio, consistência e crescimento de dividendos via yfinance."""
+
+    def __init__(self):
+        super().__init__("AgentDividend")
+        self.dividend_results: Dict[str, Any] = {}
+
+    def _safe(self, obj) -> pd.DataFrame:
+        try:
+            return obj if isinstance(obj, pd.DataFrame) and not obj.empty else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    def process_data(self, market_data: pd.DataFrame,
+                     portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        alerts = []
+        self.dividend_results = {}
+
+        skip = ("^", "BRL", "=X", "USDBRL")
+        tickers = [c for c in market_data.columns if not any(c.startswith(p) for p in skip)]
+
+        for ticker in tickers:
+            try:
+                import yfinance as yf
+                t = yf.Ticker(ticker)
+                info = t.info or {}
+                divs = self._safe(t.dividends)
+
+                res: Dict[str, Any] = {
+                    "ticker":        ticker,
+                    "name":          info.get("shortName", ticker),
+                    "sector":        info.get("sector", "N/D"),
+                    "current_price": info.get("currentPrice") or info.get("regularMarketPrice"),
+                    "payout_ratio":  info.get("payoutRatio"),
+                }
+
+                if isinstance(divs, pd.Series) and len(divs) > 0:
+                    divs.index = pd.to_datetime(divs.index).tz_localize(None)
+                    now = pd.Timestamp.now()
+
+                    # Trailing 12 meses
+                    t12 = divs[divs.index >= now - pd.DateOffset(years=1)].sum()
+                    price = res["current_price"]
+                    res["trailing_dividends_1y"] = float(t12)
+                    res["dy_trailing"] = float(t12 / price) if (price and price > 0) else None
+
+                    # Dividendos anuais
+                    divs_annual = divs.resample("YE").sum()
+                    res["div_history_annual"] = divs_annual.to_dict()
+
+                    # CAGR 5 anos
+                    years = min(5, len(divs_annual) - 1)
+                    if years >= 1 and divs_annual.iloc[-years - 1] > 0:
+                        res["dividend_cagr_5y"] = float(
+                            (divs_annual.iloc[-1] / divs_annual.iloc[-years - 1]) ** (1 / years) - 1)
+                    else:
+                        res["dividend_cagr_5y"] = None
+
+                    # Consistência: % dos últimos 5 anos com pagamento
+                    d5y = divs[divs.index >= now - pd.DateOffset(years=5)]
+                    years_paid = len(d5y.resample("YE").sum().loc[lambda s: s > 0])
+                    total_y = max(1, min(5, len(divs_annual)))
+                    res["consistency_score"] = years_paid / total_y
+                    res["years_paying"] = years_paid
+                else:
+                    res.update({
+                        "trailing_dividends_1y": 0.0, "dy_trailing": 0.0,
+                        "dividend_cagr_5y": None, "consistency_score": 0.0,
+                        "years_paying": 0, "div_history_annual": {},
+                    })
+
+                self.dividend_results[ticker] = res
+
+                dy   = res.get("dy_trailing") or 0.0
+                cagr = res.get("dividend_cagr_5y")
+                cons = res.get("consistency_score", 0.0)
+
+                if dy > 0.10:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: DY muito elevado ({dy:.1%}) — possível dividend trap",
+                        "medium", {"ticker": ticker, "dy": dy}))
+                if 0 < dy and cons < 0.5:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: Histórico de dividendos inconsistente ({cons:.0%} dos anos)",
+                        "high", {"ticker": ticker, "consistency_score": cons}))
+                if cagr is not None and cagr < -0.10:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: Crescimento negativo de dividendos 5Y ({cagr:.1%}/ano)",
+                        "medium", {"ticker": ticker, "dividend_cagr_5y": cagr}))
+
+            except Exception as e:
+                alerts.append(self.generate_alert(
+                    f"Erro em AgentDividend para {ticker}: {e}", "low",
+                    {"ticker": ticker, "error": str(e)}))
+
+        n = len(self.dividend_results)
+        alerts.append(self.generate_alert(
+            f"AgentDividend: {n} ativo(s) analisado(s)", "low",
+            {"tickers": list(self.dividend_results.keys())}))
+        return alerts
+
+
+class AgentPeerComparison(AgentBase):
+    """Comparação de múltiplos entre ativos do mesmo setor (ranking relativo + z-score)."""
+
+    def __init__(self):
+        super().__init__("AgentPeerComparison")
+        self.peer_results: Dict[str, Any] = {}
+
+    def process_data(self, market_data: pd.DataFrame,
+                     portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        alerts = []
+        self.peer_results = {}
+
+        skip = ("^", "BRL", "=X", "USDBRL")
+        tickers = [c for c in market_data.columns if not any(c.startswith(p) for p in skip)]
+
+        # Coletar setor e múltiplos
+        ticker_info: Dict[str, Dict] = {}
+        for ticker in tickers:
+            try:
+                import yfinance as yf
+                info = yf.Ticker(ticker).info or {}
+                ticker_info[ticker] = {
+                    "name":      info.get("shortName", ticker),
+                    "sector":    info.get("sector") or "Sem setor",
+                    "pe":        info.get("trailingPE") or info.get("forwardPE"),
+                    "pb":        info.get("priceToBook"),
+                    "ev_ebitda": info.get("enterpriseToEbitda"),
+                    "dy":        info.get("dividendYield"),
+                    "mkt_cap":   info.get("marketCap"),
+                }
+            except Exception:
+                ticker_info[ticker] = {"name": ticker, "sector": "Sem setor"}
+
+        # Agrupar por setor
+        sectors: Dict[str, List[str]] = {}
+        for tk, d in ticker_info.items():
+            sectors.setdefault(d["sector"], []).append(tk)
+
+        comparison: Dict[str, Any] = {}
+        METRICS = ["pe", "pb", "ev_ebitda", "dy"]
+
+        for sector, members in sectors.items():
+            if len(members) < 2:
+                # Setor com apenas 1 ativo — sem comparação possível
+                comparison[sector] = {"members": members, "solo": True}
+                continue
+
+            comp: Dict[str, Any] = {"members": members, "solo": False}
+            for metric in METRICS:
+                vals = {tk: ticker_info[tk][metric] for tk in members
+                        if ticker_info[tk].get(metric) is not None}
+                if len(vals) < 2:
+                    continue
+
+                arr = np.array(list(vals.values()))
+                mean, std = float(np.mean(arr)), float(np.std(arr))
+
+                rankings: Dict[str, Any] = {}
+                for tk, v in vals.items():
+                    z = (v - mean) / std if std > 0 else 0.0
+                    pct = float(np.mean(arr <= v))
+                    rankings[tk] = {"value": float(v), "zscore": float(z), "pct_rank": pct}
+
+                    if abs(z) > 2.0:
+                        direction = "acima" if z > 0 else "abaixo"
+                        lbl = {"pe": "P/E", "pb": "P/B", "ev_ebitda": "EV/EBITDA", "dy": "DY"}.get(metric, metric)
+                        alerts.append(self.generate_alert(
+                            f"{tk} [{sector}]: {lbl} {direction} da média setorial "
+                            f"({v:.2f} vs média {mean:.2f}, z={z:.1f})",
+                            "medium",
+                            {"ticker": tk, "metric": metric, "value": v, "zscore": z, "sector": sector}))
+
+                comp[metric] = {"rankings": rankings, "sector_mean": mean, "sector_std": std}
+            comparison[sector] = comp
+
+        self.peer_results = {
+            "ticker_info": ticker_info,
+            "sectors": sectors,
+            "comparison": comparison,
+        }
+        n_sectors = len([s for s, d in comparison.items() if not d.get("solo")])
+        alerts.append(self.generate_alert(
+            f"AgentPeerComparison: {len(sectors)} setor(es), {n_sectors} com comparação ativa",
+            "low", {"sectors": list(sectors.keys())}))
+        return alerts
+
+
+class AgentMacroSensitivity(AgentBase):
+    """Beta rolling a CDI, IPCA e câmbio via regressão OLS sobre retornos históricos."""
+
+    BCB_SERIES = {"CDI": 12, "CAMBIO": 1, "IPCA": 433}
+
+    def __init__(self):
+        super().__init__("AgentMacroSensitivity")
+        self.macro_sensitivity_results: Dict[str, Any] = {}
+
+    def _fetch_bcb(self, code: int, n: int = 756) -> Optional[pd.Series]:
+        try:
+            import requests
+            url = (f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}"
+                   f"/dados/ultimos/{n}?formato=json")
+            data = requests.get(url, timeout=10).json()
+            s = pd.Series({
+                pd.to_datetime(d["data"], dayfirst=True): float(d["valor"].replace(",", "."))
+                for d in data
+            }).sort_index()
+            return s
+        except Exception:
+            return None
+
+    def _ols_beta(self, y: np.ndarray, x: np.ndarray) -> float:
+        if len(y) < 5 or np.std(x) == 0:
+            return 0.0
+        return float(np.cov(y, x)[0, 1] / np.var(x))
+
+    def process_data(self, market_data: pd.DataFrame,
+                     portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        alerts = []
+        self.macro_sensitivity_results = {}
+
+        # 1. Obter séries macro (portfolio_config > BCB)
+        macro: Dict[str, pd.Series] = {}
+        pc_macro = (portfolio_config or {}).get("macro_df")
+        if isinstance(pc_macro, pd.DataFrame) and not pc_macro.empty:
+            for col in pc_macro.columns:
+                macro[col] = pc_macro[col].dropna()
+
+        # Buscar o que faltar diretamente no BCB
+        for name, code in self.BCB_SERIES.items():
+            if name not in macro:
+                s = self._fetch_bcb(code)
+                if s is not None:
+                    macro[name] = s
+
+        if not macro:
+            alerts.append(self.generate_alert(
+                "AgentMacroSensitivity: sem dados macro (BCB indisponível)", "medium", {}))
+            return alerts
+
+        # 2. Retornos dos ativos
+        skip = ("^", "BRL", "=X", "USDBRL")
+        asset_cols = [c for c in market_data.columns if not any(c.startswith(p) for p in skip)]
+        asset_ret = market_data[asset_cols].pct_change().dropna()
+
+        WINDOW = 63
+        results: Dict[str, Any] = {"factors": list(macro.keys()), "assets": {}}
+
+        for factor, series in macro.items():
+            # CDI/IPCA são taxas — pct_change; câmbio já é preço — pct_change também
+            factor_ret = series.pct_change().dropna()
+            factor_ret.index = pd.to_datetime(factor_ret.index).tz_localize(None)
+
+            common = asset_ret.index.intersection(factor_ret.index)
+            if len(common) < WINDOW:
+                continue
+
+            ar = asset_ret.loc[common]
+            fr = factor_ret.loc[common]
+
+            for ticker in ar.columns:
+                results["assets"].setdefault(ticker, {})
+                y = ar[ticker].values
+                x = fr.values
+
+                beta_full    = self._ols_beta(y, x)
+                beta_rolling = self._ols_beta(y[-WINDOW:], x[-WINDOW:]) if len(y) >= WINDOW else beta_full
+                r2 = float(np.corrcoef(y, x)[0, 1] ** 2) if (np.std(y) > 0 and np.std(x) > 0) else 0.0
+
+                results["assets"][ticker][factor] = {
+                    "beta_full":       round(beta_full, 4),
+                    "beta_rolling_63d": round(beta_rolling, 4),
+                    "r2":              round(r2, 4),
+                }
+
+                if factor == "CAMBIO" and abs(beta_rolling) > 0.5:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: Alta exposição cambial — beta CÂMBIO {beta_rolling:.2f}",
+                        "medium", {"ticker": ticker, "beta_cambio": beta_rolling}))
+                if factor == "CDI" and beta_rolling < -0.8:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: Alta sensibilidade negativa a juros — beta CDI {beta_rolling:.2f}",
+                        "medium", {"ticker": ticker, "beta_cdi": beta_rolling}))
+
+        self.macro_sensitivity_results = results
+        alerts.append(self.generate_alert(
+            f"AgentMacroSensitivity: {len(results['assets'])} ativo(s), fatores {list(macro.keys())}",
+            "low", {"n_assets": len(results["assets"]), "factors": list(macro.keys())}))
+        return alerts
+
+
+class AgentScenario(AgentBase):
+    """Stress test: SELIC+300bps, IPCA+4%, câmbio+20% — impacto estimado no portfólio."""
+
+    SCENARIOS: Dict[str, Dict[str, float]] = {
+        "SELIC +300bps":  {"CDI": 0.03,  "CAMBIO": 0.00, "IPCA": 0.00},
+        "IPCA +4% a.a.":  {"CDI": 0.00,  "CAMBIO": 0.00, "IPCA": 0.04},
+        "Câmbio +20%":    {"CDI": 0.00,  "CAMBIO": 0.20, "IPCA": 0.00},
+        "Combinado":      {"CDI": 0.03,  "CAMBIO": 0.20, "IPCA": 0.04},
+    }
+
+    def __init__(self):
+        super().__init__("AgentScenario")
+        self.scenario_results: Dict[str, Any] = {}
+
+    def _estimate_betas(self, returns: pd.DataFrame, market_data: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+        """Estima betas a CDI, CÂMBIO e IPCA com proxies históricas."""
+        betas: Dict[str, Dict[str, float]] = {}
+        # Proxy de câmbio: coluna FX no market_data (se existir)
+        fx_col = next((c for c in market_data.columns
+                       if any(k in c.upper() for k in ("USD", "BRL", "CAMBIO", "FX"))), None)
+
+        for ticker in returns.columns:
+            betas[ticker] = {}
+            ann_vol = float(returns[ticker].std() * np.sqrt(252))
+
+            # Beta CÂMBIO via correlação histórica com coluna FX
+            if fx_col and fx_col in market_data.columns:
+                fx_ret = market_data[fx_col].pct_change().dropna()
+                common = returns[ticker].dropna().index.intersection(fx_ret.index)
+                if len(common) > 60:
+                    y = returns[ticker].loc[common].values
+                    x = fx_ret.loc[common].values
+                    betas[ticker]["CAMBIO"] = float(np.cov(y, x)[0, 1] / np.var(x)) if np.var(x) > 0 else 0.0
+                else:
+                    betas[ticker]["CAMBIO"] = 0.0
+            else:
+                betas[ticker]["CAMBIO"] = 0.0
+
+            # Beta CDI: proxy negativo para ativos de baixa vol (mais "bond-like")
+            # Alta vol → equity-like → menor sensibilidade a taxa
+            betas[ticker]["CDI"] = float(-0.5 * max(0.0, 1.0 - ann_vol / 0.30))
+
+            # Beta IPCA: simplificado (0 — sem dados suficientes para regressão precisa)
+            betas[ticker]["IPCA"] = 0.0
+
+        return betas
+
+    def process_data(self, market_data: pd.DataFrame,
+                     portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        alerts = []
+        self.scenario_results = {}
+
+        skip = ("^", "BRL", "=X", "USDBRL")
+        asset_cols = [c for c in market_data.columns if not any(c.startswith(p) for p in skip)]
+        returns = market_data[asset_cols].pct_change().dropna()
+
+        if len(returns) < 30 or not asset_cols:
+            alerts.append(self.generate_alert(
+                "AgentScenario: dados insuficientes para stress test", "low", {}))
+            return alerts
+
+        # Pesos (equiponderado se não informado)
+        weights_cfg = (portfolio_config or {}).get("weights") or {}
+        w = {tk: weights_cfg.get(tk, 1.0 / len(asset_cols)) for tk in asset_cols}
+        w_sum = sum(w.values())
+        weights = {k: v / w_sum for k, v in w.items()}
+
+        portfolio_value = float((portfolio_config or {}).get("value", 100_000))
+
+        # Estimar betas
+        asset_betas = self._estimate_betas(returns, market_data)
+
+        # Calcular impacto por cenário
+        scenarios_out: Dict[str, Any] = {}
+        for name, shocks in self.SCENARIOS.items():
+            asset_impacts: Dict[str, float] = {}
+            for tk in asset_cols:
+                impact = sum(asset_betas[tk].get(f, 0.0) * shock
+                             for f, shock in shocks.items())
+                asset_impacts[tk] = float(impact)
+
+            port_impact = sum(weights[tk] * asset_impacts[tk] for tk in asset_cols)
+            port_brl    = portfolio_value * port_impact
+            severity    = ("SEVERO"   if port_impact < -0.10 else
+                           "MODERADO" if port_impact < -0.05 else
+                           "LEVE"     if port_impact < 0     else "POSITIVO")
+
+            scenarios_out[name] = {
+                "shocks":              shocks,
+                "asset_impacts":       asset_impacts,
+                "portfolio_impact_pct": round(port_impact, 6),
+                "portfolio_impact_brl": round(port_brl, 2),
+                "severity":            severity,
+            }
+
+            sev_map = {"SEVERO": "critical", "MODERADO": "high", "LEVE": "medium", "POSITIVO": "low"}
+            if port_impact < -0.05:
+                alerts.append(self.generate_alert(
+                    f"Stress '{name}': impacto {port_impact:.1%} no portfólio — {severity}",
+                    sev_map[severity],
+                    {"scenario": name, "impact_pct": port_impact, "impact_brl": port_brl}))
+
+        self.scenario_results = {
+            "scenarios": scenarios_out,
+            "weights": weights,
+            "asset_betas": asset_betas,
+            "portfolio_value": portfolio_value,
+        }
+
+        worst_name, worst = min(scenarios_out.items(),
+                                key=lambda x: x[1]["portfolio_impact_pct"])
+        alerts.append(self.generate_alert(
+            f"AgentScenario concluído — pior cenário: '{worst_name}' → "
+            f"{worst['portfolio_impact_pct']:.1%} ({worst['severity']})",
+            "medium" if worst["portfolio_impact_pct"] < -0.05 else "low",
+            {"worst_scenario": worst_name, **worst}))
+        return alerts
+
+
 class DaskMultiAgentOrchestrator:
     """Orquestrador principal usando Dask - CORRIGIDO"""
     
@@ -1204,6 +1981,12 @@ class DaskMultiAgentOrchestrator:
         self.agent_alert = AgentAlert()
         self.agent_lstm = AgentLSTM()
         self.agent_autoencoder = AgentAutoencoder()
+        self.agent_fundamental = AgentFundamental()
+        self.agent_credit      = AgentCredit()
+        self.agent_dividend    = AgentDividend()
+        self.agent_peer        = AgentPeerComparison()
+        self.agent_macro       = AgentMacroSensitivity()
+        self.agent_scenario    = AgentScenario()
 
         if use_dask:
             try:
@@ -1302,6 +2085,30 @@ class DaskMultiAgentOrchestrator:
             if _enabled("AgentAutoencoder"):
                 print("   🔄 AgentAutoencoder...")
                 alerts_results.append(self.agent_autoencoder.process_data(market_data))
+
+            if _enabled("AgentFundamental"):
+                print("   🔄 AgentFundamental...")
+                alerts_results.append(self.agent_fundamental.process_data(market_data, portfolio_config))
+
+            if _enabled("AgentCredit"):
+                print("   🔄 AgentCredit...")
+                alerts_results.append(self.agent_credit.process_data(market_data, portfolio_config))
+
+            if _enabled("AgentDividend"):
+                print("   🔄 AgentDividend...")
+                alerts_results.append(self.agent_dividend.process_data(market_data, portfolio_config))
+
+            if _enabled("AgentPeerComparison"):
+                print("   🔄 AgentPeerComparison...")
+                alerts_results.append(self.agent_peer.process_data(market_data, portfolio_config))
+
+            if _enabled("AgentMacroSensitivity"):
+                print("   🔄 AgentMacroSensitivity...")
+                alerts_results.append(self.agent_macro.process_data(market_data, portfolio_config))
+
+            if _enabled("AgentScenario"):
+                print("   🔄 AgentScenario...")
+                alerts_results.append(self.agent_scenario.process_data(market_data, portfolio_config))
 
             print(f"   ✅ {len(alerts_results)} agente(s) executados")
             
