@@ -2420,65 +2420,63 @@ with tab1:
             st.plotly_chart(fig_cumulative, use_container_width=True)
 
 with tab2:
-    # Sistema Multiagente
     st.markdown('<div class="section-header">🤖 Sistema Multiagente Quantitativo</div>', unsafe_allow_html=True)
-    
-    # Controles de execução
-    col1, col2, col3 = st.columns([2, 1, 1])
-    
-    with col1:
-        st.info("""
-        **🎯 Sistema com 6 Agentes Especializados:**
-        - AgentMarket: Análise de mercado em tempo real
-        - AgentClustering: Agrupamento inteligente de ativos  
-        - AgentML: Modelos de machine learning
-        - AgentLSTM: Redes neurais para previsão temporal
-        - AgentAutoencoder: Detecção avançada de anomalias
-        - AgentAlert: Sistema de priorização de alertas
-        """)
-    
-    with col2:
-        # ✅ CORREÇÃO: Botão que mantém na mesma aba
-        if st.button("🚀 Executar Análise Completa", type="primary", use_container_width=True, key="run_agents_main"):
+
+    # ── Seleção de agentes ────────────────────────────────────────────────────
+    _ALL_AGENTS = {
+        "AgentMarket":      "📈 Market — volatilidade, correlação, regime",
+        "AgentClustering":  "🎯 Clustering — K-Means + PCA por similaridade",
+        "AgentML":          "🤖 ML — Isolation Forest + Random Forest",
+        "AgentSimulation":  "🎲 Simulation — Monte Carlo / Bootstrap / GARCH",
+        "AgentLSTM":        "🧠 LSTM — previsão de tendência (MLP temporal)",
+        "AgentAutoencoder": "🔬 Autoencoder — detecção de anomalias",
+    }
+
+    with st.expander("⚙️ Selecionar agentes para executar", expanded=False):
+        _sel_cols = st.columns(2)
+        _agent_enabled = {}
+        for _i, (_key, _label) in enumerate(_ALL_AGENTS.items()):
+            with _sel_cols[_i % 2]:
+                _agent_enabled[_key] = st.checkbox(
+                    _label, value=True, key=f"agent_chk_{_key}"
+                )
+        _agents_to_run = [k for k, v in _agent_enabled.items() if v]
+        if not _agents_to_run:
+            st.warning("Selecione ao menos um agente.")
+
+    # ── Botões de controle ────────────────────────────────────────────────────
+    _btn_col, _rst_col = st.columns([2, 1])
+
+    with _btn_col:
+        _n_sel = len(_agents_to_run) if _agents_to_run else 0
+        _run_label = (f"🚀 Executar {_n_sel} agente{'s' if _n_sel != 1 else ''}"
+                      if _n_sel < len(_ALL_AGENTS)
+                      else "🚀 Executar Análise Completa")
+        if st.button(_run_label, type="primary", use_container_width=True,
+                     key="run_agents_main", disabled=not _agents_to_run):
             if st.session_state.orchestrator:
-                # Manter na mesma aba
-                st.session_state.active_tab = "🤖 Sistema Multiagente"
-                
-                with st.spinner("🤖 Executando análise multiagente coordenada..."):
+                with st.spinner(f"🤖 Executando {_n_sel} agente(s)..."):
                     try:
-                        progress_bar = st.progress(0)
-                        
-                        # Simular progresso
-                        for i in range(100):
-                            time.sleep(0.01)
-                            progress_bar.progress(i + 1)
-                        
-                        # Executar análise
-                        alerts = st.session_state.orchestrator.run_analysis(prices_filtered)
+                        alerts = st.session_state.orchestrator.run_analysis(
+                            prices_filtered,
+                            enabled_agents=_agents_to_run if _n_sel < len(_ALL_AGENTS) else None,
+                        )
                         report = st.session_state.orchestrator.generate_report(alerts)
-                        
-                        # Armazenar resultados
                         st.session_state.last_agent_report = report
                         st.session_state.last_agent_alerts = alerts
-                        
-                        st.success("✅ Análise multiagente concluída com sucesso!")
-                        
-                        # ✅ CORREÇÃO: Forçar rerun para atualizar a interface
+                        st.success(f"✅ {_n_sel} agente(s) concluídos!")
                         st.rerun()
-                        
                     except Exception as e:
                         st.error(f"❌ Erro na execução: {str(e)}")
             else:
                 st.error("❌ Sistema multiagente não inicializado!")
-    
-    with col3:
-        if st.button("🔄 Reinicializar Sistema", use_container_width=True, key="restart_agents"):
-            with st.spinner("Reinicializando sistema..."):
+
+    with _rst_col:
+        if st.button("🔄 Reinicializar", use_container_width=True, key="restart_agents"):
+            with st.spinner("Reinicializando..."):
                 st.session_state.orchestrator = initialize_multiagent_system()
-                if 'last_agent_report' in st.session_state:
-                    del st.session_state.last_agent_report
-                if 'last_agent_alerts' in st.session_state:
-                    del st.session_state.last_agent_alerts
+                st.session_state.pop("last_agent_report", None)
+                st.session_state.pop("last_agent_alerts", None)
                 st.rerun()
     
     # Exibir resultados se disponíveis

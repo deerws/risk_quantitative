@@ -1221,15 +1221,14 @@ class DaskMultiAgentOrchestrator:
                 print(f"⚠️ Dask falhou: {e}, usando modo sequencial")
                 self.use_dask = False
             
-    def run_analysis(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """Executa análise coordenada - CORRIGIDO"""
-        
-        print(f"🔍 Executando análise multiagente (Dask: {self.use_dask})...")
-        
+    def run_analysis(self, market_data: pd.DataFrame,
+                     portfolio_config: Optional[Dict[str, Any]] = None,
+                     enabled_agents: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """Executa análise coordenada. enabled_agents=None roda todos."""
+        print(f"🔍 Executando análise multiagente (agentes: {enabled_agents or 'todos'})...")
         if self.use_dask and self.client:
             return self._run_dask_parallel(market_data, portfolio_config)
-        else:
-            return self._run_sequential(market_data, portfolio_config)
+        return self._run_sequential(market_data, portfolio_config, enabled_agents)
     
     def _run_dask_parallel(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None):
         """Executa agentes em paralelo usando Dask - CORRIGIDO"""
@@ -1270,40 +1269,41 @@ class DaskMultiAgentOrchestrator:
             print(f"⚠️ Dask paralelo falhou: {e}, usando sequencial")
             return self._run_sequential(market_data, portfolio_config)
     
-    def _run_sequential(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None):
-        """Executa agentes sequencialmente (fallback) - CORRIGIDO"""
+    def _run_sequential(self, market_data: pd.DataFrame,
+                         portfolio_config: Optional[Dict[str, Any]] = None,
+                         enabled_agents: Optional[List[str]] = None):
+        """Executa agentes sequencialmente. enabled_agents=None roda todos."""
+        # None = todos habilitados; lista vazia = nenhum
+        def _enabled(name: str) -> bool:
+            return enabled_agents is None or name in enabled_agents
+
         alerts_results = []
-        
         try:
-            print("   🔄 Executando AgentMarket...")
-            market_alerts = self.agent_market.process_data(market_data)
-            alerts_results.append(market_alerts)
-            
-            print("   🔄 Executando AgentClustering...")
-            clustering_alerts = self.agent_clustering.process_data(market_data)
-            alerts_results.append(clustering_alerts)
-            
-            print("   🔄 Executando AgentML...")
-            ml_alerts = self.agent_ml.process_data(market_data)
-            alerts_results.append(ml_alerts)
-            
-            # ✅ NOVO: Executar AgentSimulation
-            print("   🔄 Executando AgentSimulation...")
-            simulation_alerts = self.agent_simulation.process_data(market_data, portfolio_config)
-            alerts_results.append(simulation_alerts)
-            
-            # Agentes TensorFlow
-            if hasattr(self, 'agent_lstm'):
-                print("   🔄 Executando AgentLSTM...")
-                lstm_alerts = self.agent_lstm.process_data(market_data)
-                alerts_results.append(lstm_alerts)
-            
-            if hasattr(self, 'agent_autoencoder'):
-                print("   🔄 Executando AgentAutoencoder...")
-                autoencoder_alerts = self.agent_autoencoder.process_data(market_data)
-                alerts_results.append(autoencoder_alerts)
-            
-            print("   ✅ Todos os agents executados")
+            if _enabled("AgentMarket"):
+                print("   🔄 AgentMarket...")
+                alerts_results.append(self.agent_market.process_data(market_data))
+
+            if _enabled("AgentClustering"):
+                print("   🔄 AgentClustering...")
+                alerts_results.append(self.agent_clustering.process_data(market_data))
+
+            if _enabled("AgentML"):
+                print("   🔄 AgentML...")
+                alerts_results.append(self.agent_ml.process_data(market_data))
+
+            if _enabled("AgentSimulation"):
+                print("   🔄 AgentSimulation...")
+                alerts_results.append(self.agent_simulation.process_data(market_data, portfolio_config))
+
+            if _enabled("AgentLSTM"):
+                print("   🔄 AgentLSTM...")
+                alerts_results.append(self.agent_lstm.process_data(market_data))
+
+            if _enabled("AgentAutoencoder"):
+                print("   🔄 AgentAutoencoder...")
+                alerts_results.append(self.agent_autoencoder.process_data(market_data))
+
+            print(f"   ✅ {len(alerts_results)} agente(s) executados")
             
         except Exception as e:
             print(f"   ❌ Erro na execução sequencial: {e}")
