@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -1176,6 +1177,13 @@ st.markdown("""
 
     [data-testid="stSidebar"] {
         background-color: #1e2130 !important;
+        min-width: 360px !important;
+        width: 360px !important;
+    }
+
+    /* Permite redimensionar a sidebar normalmente */
+    [data-testid="stSidebarResizeHandle"] {
+        visibility: visible !important;
     }
 
     .main {
@@ -1434,6 +1442,7 @@ ASSET_PRESETS = {
     "🇧🇷 B3":    ["PETR4.SA", "VALE3.SA", "ITUB4.SA", "BBDC4.SA", "ABEV3.SA", "WEGE3.SA"],
     "🇺🇸 NYSE":  ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"],
     "₿ Crypto":  ["BTC-USD", "ETH-USD", "SOL-USD"],
+    "🏢 FIIs":   ["KNRI11.SA", "HGLG11.SA", "MXRF11.SA", "XPML11.SA", "VISC11.SA"],
     "📊 ETFs":   ["SPY", "QQQ", "BOVA11.SA", "IVVB11.SA"],
     "💱 Forex":  ["USDBRL=X", "EURBRL=X", "JPYBRL=X"],
 }
@@ -1452,45 +1461,138 @@ BACEN_SERIES = {
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_portfolio_data(tickers_tuple: tuple, period: str,
                          custom_start: str = None, custom_end: str = None):
-    """Baixa preços via yfinance. Retorna (returns, prices_norm_100)."""
+    """Baixa preços via yfinance com fallback automático de sufixo .SA para B3.
+    Retorna (returns, prices_norm_100)."""
     if not tickers_tuple:
         return pd.DataFrame(), pd.DataFrame()
 
-    tickers = list(tickers_tuple)
-    try:
-        import yfinance as yf
+    import yfinance as yf
+    import re
 
-        kwargs = dict(auto_adjust=True, progress=False)
-        if period == "custom" and custom_start and custom_end:
-            raw = yf.download(tickers, start=custom_start, end=custom_end, **kwargs)
-        else:
-            raw = yf.download(tickers, period=period, **kwargs)
-
+    def _download(tickers, **kw):
+        raw = yf.download(tickers, **kw)
         if raw.empty:
-            return pd.DataFrame(), pd.DataFrame()
+            return pd.DataFrame()
+        prices = raw["Close"].copy() if isinstance(raw.columns, pd.MultiIndex) \
+                 else raw[["Close"]].rename(columns={"Close": tickers[0]})
+        return prices
 
-        # Extrair coluna Close (multi-index quando vários tickers)
-        if isinstance(raw.columns, pd.MultiIndex):
-            prices = raw["Close"].copy()
-        else:
-            prices = raw[["Close"]].copy()
-            prices.columns = [tickers[0]]
+    kwargs = dict(auto_adjust=True, progress=False)
+    if period == "custom" and custom_start and custom_end:
+        kwargs.update(start=custom_start, end=custom_end)
+    else:
+        kwargs["period"] = period
 
-        # Remover ativos sem dados suficientes (> 50% NaN)
-        prices = prices.dropna(axis=1, thresh=max(1, int(len(prices) * 0.5)))
-        prices = prices.ffill().bfill().dropna()
+    # Separar tickers que parecem B3 sem sufixo (ex: "PETR4" → tenta "PETR4.SA")
+    _b3_pattern = re.compile(r"^[A-Z]{4}\d{1,2}$")
+    primary   = list(tickers_tuple)
+    sa_remap  = {}   # original → com .SA
 
-        if prices.empty:
-            return pd.DataFrame(), pd.DataFrame()
+    prices_all = pd.DataFrame()
 
-        # Normalizar a 100 no início → comparação justa entre ativos de escalas diferentes
-        prices_norm = prices.div(prices.iloc[0]) * 100
+    # 1ª tentativa: todos os tickers como vieram
+    try:
+        prices_all = _download(primary, **kwargs)
+    except Exception:
+        pass
 
-        returns = prices.pct_change().dropna()
-        return returns, prices_norm
+    # Identificar os que não vieram e tentar com .SA
+    missing = [t for t in primary
+               if prices_all.empty or t not in prices_all.columns
+               if _b3_pattern.match(t)]
 
-    except Exception as e:
+    if missing:
+        sa_tickers = [t + ".SA" for t in missing]
+        sa_remap   = dict(zip(sa_tickers, missing))
+        try:
+            prices_sa = _download(sa_tickers, **kwargs)
+            if not prices_sa.empty:
+                prices_sa = prices_sa.rename(columns=sa_remap)
+                prices_all = prices_sa if prices_all.empty \
+                             else pd.concat([prices_all, prices_sa], axis=1)
+        except Exception:
+            pass
+
+    if prices_all.empty:
         return pd.DataFrame(), pd.DataFrame()
+
+    prices_all = prices_all.dropna(axis=1, thresh=max(1, int(len(prices_all) * 0.5)))
+    prices_all = prices_all.ffill().bfill().dropna()
+
+    if prices_all.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    prices_norm = prices_all.div(prices_all.iloc[0]) * 100
+    returns     = prices_all.pct_change().dropna()
+    return returns, prices_norm
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_benchmarks_br(selected_names: tuple, days: int = 365):
+    """Busca benchmarks de renda fixa BR via BACEN. Retorna DataFrame normalizado a 100."""
+    if not selected_names:
+        return pd.DataFrame()
+    try:
+        from src.etl.benchmarks_br import BENCHMARK_FUNCS
+        series = []
+        for name in selected_names:
+            if name in BENCHMARK_FUNCS:
+                s = BENCHMARK_FUNCS[name](days)
+                if not s.empty:
+                    series.append(s)
+        if not series:
+            return pd.DataFrame()
+        return pd.concat(series, axis=1).ffill().dropna()
+    except Exception:
+        return pd.DataFrame()
+
+
+INTRADAY_PERIODS   = ["Hoje", "2 dias", "5 dias"]
+INTRADAY_INTERVALS = ["1m", "5m", "15m", "30m", "1h"]
+_INTRADAY_PERIOD_MAP = {"Hoje": "1d", "2 dias": "2d", "5 dias": "5d"}
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_intraday_data(tickers_tuple: tuple, period: str, interval: str):
+    """Baixa dados intraday via yfinance. TTL=60s para aproximar tempo real.
+    Retorna (returns, prices) com preços brutos (sem normalização — candlestick usa preço real)."""
+    if not tickers_tuple:
+        return pd.DataFrame(), pd.DataFrame()
+    import yfinance as yf, re
+    _b3 = re.compile(r"^[A-Z]{4}\d{1,2}$")
+    tickers = list(tickers_tuple)
+    kw = dict(period=period, interval=interval, auto_adjust=True, progress=False)
+
+    def _dl(tkrs):
+        raw = yf.download(tkrs, **kw)
+        if raw.empty:
+            return pd.DataFrame()
+        return raw["Close"].copy() if isinstance(raw.columns, pd.MultiIndex) \
+               else raw[["Close"]].rename(columns={"Close": tkrs[0]})
+
+    prices = _dl(tickers)
+
+    # Fallback .SA para tickers B3 sem sufixo
+    missing = [t for t in tickers
+               if prices.empty or t not in prices.columns
+               if _b3.match(t)]
+    if missing:
+        sa_map   = {t + ".SA": t for t in missing}
+        prices_sa = _dl(list(sa_map.keys()))
+        if not prices_sa.empty:
+            prices_sa = prices_sa.rename(columns=sa_map)
+            prices = prices_sa if prices.empty \
+                     else pd.concat([prices, prices_sa], axis=1)
+
+    if prices.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    prices = prices.dropna(axis=1, thresh=max(1, int(len(prices) * 0.3))).ffill().bfill()
+    prices = prices.dropna()
+    if prices.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    returns = prices.pct_change().dropna()
+    return returns, prices
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1726,6 +1828,17 @@ def display_agent_analytics(alerts):
 
 st.sidebar.markdown('<div class="section-header">🔍 Busca de Ativos</div>', unsafe_allow_html=True)
 
+# --- Toggle de Modo ---
+app_mode = st.sidebar.radio(
+    "Modo de operação:",
+    ["📊 Análise de Risco", "⚡ Day Trader"],
+    horizontal=True,
+    key="app_mode",
+)
+if app_mode == "⚡ Day Trader":
+    st.sidebar.info("⚡ **Day Trader**: dados intraday com atualização automática a cada 60s.", icon="⚡")
+st.sidebar.markdown("---")
+
 # --- Estado inicial dos tickers ---
 if "tickers_text" not in st.session_state:
     st.session_state.tickers_text = "PETR4.SA, VALE3.SA, ITUB4.SA, BBDC4.SA, WEGE3.SA"
@@ -1741,18 +1854,77 @@ if "data_timestamp" not in st.session_state:
     st.session_state.data_timestamp = None
 if "invalid_tickers" not in st.session_state:
     st.session_state.invalid_tickers = []
+if "app_mode" not in st.session_state:
+    st.session_state.app_mode = "📊 Análise de Risco"
+if "intraday_period" not in st.session_state:
+    st.session_state.intraday_period = "Hoje"
+if "intraday_interval" not in st.session_state:
+    st.session_state.intraday_interval = "5m"
+if "intraday_data" not in st.session_state:
+    st.session_state.intraday_data = (pd.DataFrame(), pd.DataFrame())
 
 # --- Presets rápidos ---
 st.sidebar.markdown("**Pré-seleções rápidas:**")
-preset_cols = st.sidebar.columns(len(ASSET_PRESETS))
-for col, (label, tickers_preset) in zip(preset_cols, ASSET_PRESETS.items()):
-    with col:
-        if st.button(label, key=f"preset_{label}", use_container_width=True):
-            st.session_state.tickers_text = ", ".join(tickers_preset)
+_preset_items = list(ASSET_PRESETS.items())
+# 3 colunas por linha (6 presets → 2 linhas de 3)
+for _row in [_preset_items[:3], _preset_items[3:]]:
+    _cols = st.sidebar.columns(3)
+    for _col, (_label, _tickers_preset) in zip(_cols, _row):
+        with _col:
+            if st.button(_label, key=f"preset_{_label}", use_container_width=True):
+                st.session_state.tickers_text = ", ".join(_tickers_preset)
+
+# --- Busca por nome ---
+@st.cache_data(ttl=120, show_spinner=False)
+def search_ticker(query: str):
+    """Busca tickers no Yahoo Finance pelo nome ou símbolo."""
+    try:
+        import yfinance as yf
+        results = yf.Search(query, max_results=8)
+        return [
+            {
+                "symbol": q.get("symbol", ""),
+                "name":   q.get("shortname") or q.get("longname") or "",
+                "exchange": q.get("exchange", ""),
+            }
+            for q in results.quotes
+            if q.get("symbol")
+        ]
+    except Exception:
+        return []
+
+search_query = st.sidebar.text_input(
+    "🔎 Buscar ativo por nome:",
+    placeholder="ex: embraer, bitcoin, apple...",
+    key="asset_search_input"
+)
+
+if search_query.strip():
+    with st.sidebar:
+        with st.spinner("Buscando..."):
+            hits = search_ticker(search_query.strip())
+
+    if hits:
+        options = [f"{h['symbol']}  —  {h['name']}  [{h['exchange']}]" for h in hits]
+        chosen = st.sidebar.selectbox(
+            "Resultado — selecione e clique em Adicionar:",
+            options=[""] + options,
+            key="search_result_select"
+        )
+        if chosen and st.sidebar.button("➕ Adicionar ao portfólio", key="add_search_result"):
+            ticker_to_add = chosen.split("  —  ")[0].strip()
+            current = st.session_state.tickers_text.strip().rstrip(",")
+            st.session_state.tickers_text = (
+                f"{current}, {ticker_to_add}" if current else ticker_to_add
+            )
+    else:
+        st.sidebar.caption("Nenhum resultado encontrado.")
+
+st.sidebar.markdown("---")
 
 # --- Input de tickers ---
 tickers_input = st.sidebar.text_area(
-    "Tickers (separados por vírgula ou nova linha):",
+    "Tickers no portfólio (separados por vírgula):",
     value=st.session_state.tickers_text,
     height=100,
     placeholder="PETR4.SA, VALE3.SA, AAPL, BTC-USD",
@@ -1761,68 +1933,127 @@ tickers_input = st.sidebar.text_area(
 )
 st.session_state.tickers_text = tickers_input
 
-# --- Seletor de período ---
-st.sidebar.markdown("**📅 Período de análise:**")
-period_label = st.sidebar.radio(
-    "Período",
-    options=PERIOD_OPTIONS,
-    index=PERIOD_OPTIONS.index(st.session_state.selected_period),
-    horizontal=True,
-    label_visibility="collapsed",
-    key="period_radio"
-)
-st.session_state.selected_period = period_label
+if app_mode == "📊 Análise de Risco":
+    # --- Seletor de período ---
+    st.sidebar.markdown("**📅 Período de análise:**")
+    period_label = st.sidebar.radio(
+        "Período",
+        options=PERIOD_OPTIONS,
+        index=PERIOD_OPTIONS.index(st.session_state.selected_period),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="period_radio"
+    )
+    st.session_state.selected_period = period_label
 
-custom_start_str, custom_end_str = None, None
-if period_label == "Personalizado":
-    c1, c2 = st.sidebar.columns(2)
-    with c1:
-        cs = st.date_input("Início", key="custom_start_input")
-    with c2:
-        ce = st.date_input("Fim", key="custom_end_input")
-    custom_start_str = str(cs)
-    custom_end_str   = str(ce)
+    custom_start_str, custom_end_str = None, None
+    if period_label == "Personalizado":
+        c1, c2 = st.sidebar.columns(2)
+        with c1:
+            cs = st.date_input("Início", key="custom_start_input")
+        with c2:
+            ce = st.date_input("Fim", key="custom_end_input")
+        custom_start_str = str(cs)
+        custom_end_str   = str(ce)
 
-# --- Botão Atualizar ---
-col_btn, col_info = st.sidebar.columns([1, 1])
-with col_btn:
-    fetch_btn = st.button("🔄 Atualizar Dados", type="primary",
-                          use_container_width=True, key="fetch_data_btn")
-with col_info:
-    if st.session_state.data_timestamp:
-        st.caption(f"⏱ {st.session_state.data_timestamp}")
+    # --- Botão Atualizar ---
+    col_btn, col_info = st.sidebar.columns([1, 1])
+    with col_btn:
+        fetch_btn = st.button("🔄 Atualizar Dados", type="primary",
+                              use_container_width=True, key="fetch_data_btn")
+    with col_info:
+        if st.session_state.data_timestamp:
+            st.caption(f"⏱ {st.session_state.data_timestamp}")
 
-# --- Parâmetros de risco ---
-st.sidebar.markdown("---")
-st.sidebar.markdown("**🎯 Parâmetros de Risco**")
-risk_free_rate   = st.sidebar.slider("Taxa Livre de Risco (% a.a):", 0.0, 20.0, 11.75, 0.1) / 100
-confidence_level = st.sidebar.slider("Nível de Confiança VaR:", 0.90, 0.99, 0.95, 0.01)
+    # --- Parâmetros de risco ---
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**🎯 Parâmetros de Risco**")
+    risk_free_rate   = st.sidebar.slider("Taxa Livre de Risco (% a.a):", 0.0, 20.0, 11.75, 0.1) / 100
+    confidence_level = st.sidebar.slider("Nível de Confiança VaR:", 0.90, 0.99, 0.95, 0.01)
 
-# --- Overlay BACEN ---
-st.sidebar.markdown("---")
-st.sidebar.markdown("**📊 Overlay Macroeconômico (BACEN)**")
-bacen_selections = st.sidebar.multiselect(
-    "Séries macroeconômicas:",
-    options=list(BACEN_SERIES.keys()),
-    default=[],
-    key="bacen_overlay_select"
-)
+    # --- Benchmarks de renda fixa BR ---
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**🏦 Benchmarks Renda Fixa BR**")
+    st.sidebar.caption("Sobrepostos no gráfico de desempenho — dados via BACEN")
 
-# --- Configurações avançadas ---
-st.sidebar.markdown("---")
-st.sidebar.markdown("**🔧 Configurações Avançadas**")
-use_dask           = st.sidebar.checkbox("Usar Dask (Processamento Paralelo)", value=False)
-use_tensorflow     = st.sidebar.checkbox("Usar TensorFlow (Deep Learning)", value=False)
-enable_clustering  = st.sidebar.checkbox("Ativar Clustering de Ativos", value=True)
-enable_ml_detection= st.sidebar.checkbox("Ativar Detecção ML", value=True)
+    from src.etl.benchmarks_br import BENCHMARK_FUNCS as _BF
+    benchmark_selections = st.sidebar.multiselect(
+        "Comparar portfólio com:",
+        options=list(_BF.keys()),
+        default=[],
+        key="benchmark_select"
+    )
+
+    # --- Overlay macro BACEN (séries brutas) ---
+    st.sidebar.markdown("**📊 Overlay Macro BACEN**")
+    bacen_selections = st.sidebar.multiselect(
+        "Séries brutas (eixo secundário):",
+        options=list(BACEN_SERIES.keys()),
+        default=[],
+        key="bacen_overlay_select"
+    )
+
+    # --- Configurações avançadas ---
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**🔧 Configurações Avançadas**")
+    enable_clustering  = st.sidebar.checkbox("Ativar Clustering de Ativos", value=True)
+    enable_ml_detection= st.sidebar.checkbox("Ativar Detecção ML", value=True)
+
+else:  # ⚡ Day Trader
+    # --- Período intraday ---
+    st.sidebar.markdown("**📅 Período:**")
+    intraday_period_label = st.sidebar.radio(
+        "Período intraday",
+        options=INTRADAY_PERIODS,
+        index=INTRADAY_PERIODS.index(st.session_state.intraday_period),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="intraday_period_radio"
+    )
+    st.session_state.intraday_period = intraday_period_label
+
+    # --- Intervalo intraday ---
+    st.sidebar.markdown("**⏱ Intervalo:**")
+    intraday_interval_sel = st.sidebar.radio(
+        "Intervalo",
+        options=INTRADAY_INTERVALS,
+        index=INTRADAY_INTERVALS.index(st.session_state.intraday_interval),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="intraday_interval_radio"
+    )
+    st.session_state.intraday_interval = intraday_interval_sel
+
+    # --- Botão Atualizar ---
+    col_btn, col_info = st.sidebar.columns([1, 1])
+    with col_btn:
+        fetch_btn = st.button("🔄 Atualizar", type="primary",
+                              use_container_width=True, key="fetch_data_btn")
+    with col_info:
+        if st.session_state.data_timestamp:
+            st.caption(f"⏱ {st.session_state.data_timestamp}")
+
+    # Defaults para variáveis usadas downstream
+    period_label        = "1A"
+    custom_start_str    = None
+    custom_end_str      = None
+    risk_free_rate      = 0.1175
+    confidence_level    = 0.95
+    benchmark_selections = []
+    bacen_selections     = []
+    enable_clustering    = False
+    enable_ml_detection  = False
+
+use_dask       = False  # Dask não instalado — modo sequencial
+use_tensorflow = False  # placeholder
 
 # --- Tech Stack badges ---
 st.sidebar.markdown("---")
 st.sidebar.markdown("**🛠️ Tech Stack:**")
 st.sidebar.markdown(
     '<span class="tech-badge">yfinance</span>'
-    '<span class="tech-badge">Dask</span>'
     '<span class="tech-badge">Scikit-learn</span>'
+    '<span class="tech-badge">Plotly</span>'
     '<span class="tech-badge">6 Agents</span>',
     unsafe_allow_html=True
 )
@@ -1838,29 +2069,54 @@ def _parse_tickers(raw: str) -> tuple:
     cleaned = [t.strip().upper() for t in tokens if t.strip()]
     return tuple(dict.fromkeys(cleaned))  # Remove duplicatas, preserva ordem
 
-# Disparar fetch quando botão clicado ou ainda sem dados
-should_fetch = fetch_btn or st.session_state.portfolio_data[0].empty
+# Auto-refresh de 60s ativo somente no modo Day Trader
+if app_mode == "⚡ Day Trader":
+    _refresh_count = st_autorefresh(interval=60_000, key="dt_autorefresh")
 
-if should_fetch:
-    tickers_tuple = _parse_tickers(tickers_input)
+tickers_tuple = _parse_tickers(tickers_input)
+
+if app_mode == "⚡ Day Trader":
+    # Day Trader — sempre chama fetch_intraday_data; o cache TTL=60s evita downloads desnecessários.
+    # O auto-refresh dispara a cada 60s coincidindo com a expiração do cache → dados frescos.
+    _intraday_period   = _INTRADAY_PERIOD_MAP[st.session_state.intraday_period]
+    _intraday_interval = st.session_state.intraday_interval
+
     if tickers_tuple:
-        yf_period = PERIOD_MAP[period_label]
-        with st.spinner(f"Baixando dados de {len(tickers_tuple)} ativo(s)..."):
-            ret, prc = fetch_portfolio_data(
-                tickers_tuple, yf_period, custom_start_str, custom_end_str
-            )
-        if not ret.empty:
-            st.session_state.portfolio_data  = (ret, prc)
-            st.session_state.data_timestamp  = datetime.now().strftime("%H:%M:%S")
-            # Tickers inválidos = os que não vieram nos dados
-            fetched = set(ret.columns.tolist())
+        ret_i, prc_i = fetch_intraday_data(tickers_tuple, _intraday_period, _intraday_interval)
+        if not ret_i.empty:
+            st.session_state.intraday_data  = (ret_i, prc_i)
+            st.session_state.data_timestamp = datetime.now().strftime("%H:%M:%S")
+            fetched = set(ret_i.columns.tolist())
             st.session_state.invalid_tickers = [t for t in tickers_tuple if t not in fetched]
-        else:
-            st.error("❌ Nenhum dado retornado. Verifique os tickers e tente novamente.")
-    else:
-        st.warning("⚠️ Insira ao menos um ticker válido.")
+        elif fetch_btn:
+            st.error("❌ Sem dados intraday. Verifique os tickers.")
+    elif fetch_btn:
+        st.warning("⚠️ Insira ao menos um ticker.")
 
-returns, prices = st.session_state.portfolio_data
+    returns, prices = st.session_state.intraday_data
+
+else:
+    # Análise de Risco — fetch EOD (comportamento original)
+    should_fetch = fetch_btn or st.session_state.portfolio_data[0].empty
+
+    if should_fetch:
+        if tickers_tuple:
+            yf_period = PERIOD_MAP[period_label]
+            with st.spinner(f"Baixando dados de {len(tickers_tuple)} ativo(s)..."):
+                ret, prc = fetch_portfolio_data(
+                    tickers_tuple, yf_period, custom_start_str, custom_end_str
+                )
+            if not ret.empty:
+                st.session_state.portfolio_data  = (ret, prc)
+                st.session_state.data_timestamp  = datetime.now().strftime("%H:%M:%S")
+                fetched = set(ret.columns.tolist())
+                st.session_state.invalid_tickers = [t for t in tickers_tuple if t not in fetched]
+            else:
+                st.error("❌ Nenhum dado retornado. Verifique os tickers e tente novamente.")
+        else:
+            st.warning("⚠️ Insira ao menos um ticker válido.")
+
+    returns, prices = st.session_state.portfolio_data
 
 # Alertas de tickers inválidos
 if st.session_state.invalid_tickers:
@@ -1898,9 +2154,20 @@ prices_filtered   = prices[selected_assets]
 # Retorno ponderado do portfólio (pesos iguais)
 portfolio_returns = returns_filtered.mean(axis=1)
 
-# --- Overlay macroeconômico (BACEN) ---
+# --- Benchmarks e Macro (somente no modo Análise de Risco) ---
+_period_days = {"1M": 31, "3M": 92, "6M": 183, "1A": 365,
+                "2A": 730, "5A": 1825, "Personalizado": 365}
+_bench_days = _period_days.get(st.session_state.get("selected_period", "1A"), 365)
+
+benchmark_df = pd.DataFrame()
+if benchmark_selections and app_mode == "📊 Análise de Risco":
+    with st.spinner("Carregando benchmarks de renda fixa..."):
+        benchmark_df = fetch_benchmarks_br(
+            tuple(benchmark_selections), days=_bench_days
+        )
+
 macro_df = pd.DataFrame()
-if bacen_selections:
+if bacen_selections and app_mode == "📊 Análise de Risco":
     selected_codes = tuple((k, BACEN_SERIES[k]) for k in bacen_selections)
     with st.spinner("Carregando dados do BACEN..."):
         macro_df = fetch_bacen_macro(selected_codes)
@@ -1919,90 +2186,187 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 ])
 
 with tab1:
-    # Dashboard Principal
-    st.markdown('<div class="section-header">📈 Visão Geral do Portfólio</div>', unsafe_allow_html=True)
-    
-    # Métricas rápidas
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        total_return = (1 + portfolio_returns).prod() - 1
-        st.metric("📈 Retorno Total", f"{total_return:.2%}")
-    
-    with col2:
-        annual_vol = portfolio_returns.std() * np.sqrt(252)
-        st.metric("📉 Volatilidade Anual", f"{annual_vol:.2%}")
-    
-    with col3:
-        sharpe = (portfolio_returns.mean() * 252 - risk_free_rate) / (annual_vol + 1e-8)
-        st.metric("🎯 Sharpe Ratio", f"{sharpe:.2f}")
-    
-    with col4:
-        var_95 = np.percentile(portfolio_returns, (1 - confidence_level) * 100)
-        st.metric(f"⚠️ VaR {confidence_level:.0%}", f"{var_95:.2%}")
-    
-    # Status dos agentes
-    display_agent_status()
-    
-    # Gráficos principais
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("📊 Desempenho Normalizado (Base 100)")
-        fig_prices = go.Figure()
-        for asset in prices_filtered.columns:
-            fig_prices.add_trace(go.Scatter(
-                x=prices_filtered.index,
-                y=prices_filtered[asset],
-                name=asset,
-                line=dict(width=2)
-            ))
-        # Overlay BACEN (eixo secundário)
-        if not macro_df.empty:
-            for col in macro_df.columns:
+    if app_mode == "⚡ Day Trader":
+        # ── DAY TRADER VIEW ──────────────────────────────────────────────────
+        st.markdown('<div class="section-header">⚡ Day Trader — Dados Intraday</div>',
+                    unsafe_allow_html=True)
+
+        # Banner de aviso sobre delay B3
+        st.warning(
+            "⏱ **Atenção:** Dados de ações B3 possuem atraso de ~15 minutos (política da B3/yfinance). "
+            "Ativos internacionais (NYSE, Crypto) costumam ter delay menor. "
+            "**Não use para execução de ordens — apenas análise.**",
+            icon="⚠️"
+        )
+
+        # Timestamp e intervalo ativos
+        _ts  = st.session_state.data_timestamp or "—"
+        _per = st.session_state.intraday_period
+        _ivl = st.session_state.intraday_interval
+        st.caption(f"Última atualização: **{_ts}** · Período: **{_per}** · Intervalo: **{_ivl}** · Auto-refresh: 60s")
+
+        # Cards de preço por ativo
+        if not prices.empty:
+            _assets_dt = prices_filtered.columns.tolist()
+            _n = len(_assets_dt)
+            _cols_cards = st.columns(min(_n, 4))
+            for _i, _asset in enumerate(_assets_dt):
+                _col_idx = _i % min(_n, 4)
+                with _cols_cards[_col_idx]:
+                    _s = prices_filtered[_asset].dropna()
+                    if len(_s) >= 2:
+                        _last  = float(_s.iloc[-1])
+                        _open  = float(_s.iloc[0])
+                        _high  = float(_s.max())
+                        _low   = float(_s.min())
+                        _chg   = (_last - _open) / _open if _open != 0 else 0
+                        st.metric(
+                            label=_asset,
+                            value=f"{_last:.2f}",
+                            delta=f"{_chg:+.2%}  (H:{_high:.2f} L:{_low:.2f})"
+                        )
+
+            # Candlestick por ativo (expander por ativo)
+            import yfinance as yf
+            _yfkw = dict(
+                period=_INTRADAY_PERIOD_MAP[_per],
+                interval=_ivl,
+                auto_adjust=True,
+                progress=False
+            )
+            for _asset in _assets_dt:
+                with st.expander(f"📊 Candlestick — {_asset}", expanded=(_asset == _assets_dt[0])):
+                    try:
+                        _ohlc = yf.download([_asset], **_yfkw)
+                        if _ohlc.empty:
+                            _ticker_sa = _asset if _asset.endswith(".SA") else _asset + ".SA"
+                            _ohlc = yf.download([_ticker_sa], **_yfkw)
+                        if not _ohlc.empty:
+                            if isinstance(_ohlc.columns, pd.MultiIndex):
+                                _ohlc.columns = _ohlc.columns.get_level_values(0)
+                            _fig_cs = go.Figure(go.Candlestick(
+                                x=_ohlc.index,
+                                open=_ohlc["Open"],
+                                high=_ohlc["High"],
+                                low=_ohlc["Low"],
+                                close=_ohlc["Close"],
+                                name=_asset,
+                                increasing_line_color="#2ecc71",
+                                decreasing_line_color="#e74c3c",
+                            ))
+                            _fig_cs.update_layout(
+                                height=350,
+                                plot_bgcolor='rgba(0,0,0,0)',
+                                paper_bgcolor='rgba(0,0,0,0)',
+                                font=dict(color='#f0f2f6'),
+                                xaxis=dict(gridcolor='#333', rangeslider=dict(visible=False)),
+                                yaxis=dict(gridcolor='#333'),
+                                margin=dict(l=10, r=10, t=30, b=10),
+                            )
+                            st.plotly_chart(_fig_cs, use_container_width=True)
+                        else:
+                            st.caption(f"Sem dados OHLC para {_asset}.")
+                    except Exception as _e:
+                        st.caption(f"Erro ao carregar candlestick: {_e}")
+        else:
+            st.info("👈 Clique **Atualizar** na sidebar para carregar dados intraday.")
+
+    else:
+        # ── ANÁLISE DE RISCO VIEW (padrão) ──────────────────────────────────
+        st.markdown('<div class="section-header">📈 Visão Geral do Portfólio</div>',
+                    unsafe_allow_html=True)
+
+        # Métricas rápidas
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            total_return = (1 + portfolio_returns).prod() - 1
+            st.metric("📈 Retorno Total", f"{total_return:.2%}")
+
+        with col2:
+            annual_vol = portfolio_returns.std() * np.sqrt(252)
+            st.metric("📉 Volatilidade Anual", f"{annual_vol:.2%}")
+
+        with col3:
+            sharpe = (portfolio_returns.mean() * 252 - risk_free_rate) / (annual_vol + 1e-8)
+            st.metric("🎯 Sharpe Ratio", f"{sharpe:.2f}")
+
+        with col4:
+            var_95 = np.percentile(portfolio_returns, (1 - confidence_level) * 100)
+            st.metric(f"⚠️ VaR {confidence_level:.0%}", f"{var_95:.2%}")
+
+        # Status dos agentes
+        display_agent_status()
+
+        # Gráficos principais
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("📊 Desempenho Normalizado (Base 100)")
+            fig_prices = go.Figure()
+            for asset in prices_filtered.columns:
                 fig_prices.add_trace(go.Scatter(
-                    x=macro_df.index,
-                    y=macro_df[col],
-                    name=col,
-                    line=dict(width=1, dash="dot"),
-                    yaxis="y2",
-                    opacity=0.7
+                    x=prices_filtered.index,
+                    y=prices_filtered[asset],
+                    name=asset,
+                    line=dict(width=2)
                 ))
-        fig_prices.update_layout(
-            height=400,
-            showlegend=True,
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            font=dict(color='#f0f2f6'),
-            xaxis=dict(gridcolor='#333'),
-            yaxis=dict(gridcolor='#333', title="Base 100"),
-            yaxis2=dict(overlaying="y", side="right", gridcolor='#222',
-                        title="BACEN", showgrid=False) if not macro_df.empty else {},
-            legend=dict(bgcolor='rgba(0,0,0,0)')
-        )
-        st.plotly_chart(fig_prices, use_container_width=True)
-    
-    with col2:
-        st.subheader("📈 Retornos Acumulados")
-        cumulative_returns = (1 + returns_filtered).cumprod()
-        fig_cumulative = go.Figure()
-        for asset in cumulative_returns.columns:
-            fig_cumulative.add_trace(go.Scatter(
-                x=cumulative_returns.index,
-                y=cumulative_returns[asset],
-                name=asset,
-                line=dict(width=2)
-            ))
-        fig_cumulative.update_layout(
-            height=400, 
-            showlegend=True,
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            font=dict(color='#f0f2f6'),
-            xaxis=dict(gridcolor='#333'),
-            yaxis=dict(gridcolor='#333')
-        )
-        st.plotly_chart(fig_cumulative, use_container_width=True)
+            bench_colors = ["#f39c12", "#e74c3c", "#9b59b6", "#1abc9c", "#e67e22"]
+            if not benchmark_df.empty:
+                for i, col in enumerate(benchmark_df.columns):
+                    fig_prices.add_trace(go.Scatter(
+                        x=benchmark_df.index,
+                        y=benchmark_df[col],
+                        name=col,
+                        line=dict(width=2, dash="dash",
+                                  color=bench_colors[i % len(bench_colors)]),
+                        opacity=0.85
+                    ))
+            if not macro_df.empty:
+                for col in macro_df.columns:
+                    fig_prices.add_trace(go.Scatter(
+                        x=macro_df.index,
+                        y=macro_df[col],
+                        name=col,
+                        line=dict(width=1, dash="dot"),
+                        yaxis="y2",
+                        opacity=0.7
+                    ))
+            fig_prices.update_layout(
+                height=400,
+                showlegend=True,
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='#f0f2f6'),
+                xaxis=dict(gridcolor='#333'),
+                yaxis=dict(gridcolor='#333', title="Base 100"),
+                yaxis2=dict(overlaying="y", side="right", gridcolor='#222',
+                            title="BACEN", showgrid=False) if not macro_df.empty else {},
+                legend=dict(bgcolor='rgba(0,0,0,0)')
+            )
+            st.plotly_chart(fig_prices, use_container_width=True)
+
+        with col2:
+            st.subheader("📈 Retornos Acumulados")
+            cumulative_returns = (1 + returns_filtered).cumprod()
+            fig_cumulative = go.Figure()
+            for asset in cumulative_returns.columns:
+                fig_cumulative.add_trace(go.Scatter(
+                    x=cumulative_returns.index,
+                    y=cumulative_returns[asset],
+                    name=asset,
+                    line=dict(width=2)
+                ))
+            fig_cumulative.update_layout(
+                height=400,
+                showlegend=True,
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='#f0f2f6'),
+                xaxis=dict(gridcolor='#333'),
+                yaxis=dict(gridcolor='#333')
+            )
+            st.plotly_chart(fig_cumulative, use_container_width=True)
 
 with tab2:
     # Sistema Multiagente
@@ -2316,7 +2680,7 @@ with tab4:
                 weights=get_current_weights(selected_assets)
             )
             if result:
-                existing = st.session_state.get('current_simulation_results', {})
+                existing = st.session_state.get('current_simulation_results') or {}
                 existing[algorithm] = result
                 st.session_state.current_simulation_results = existing
                 st.success(f"✅ {algorithm} concluído!")
@@ -2466,15 +2830,15 @@ with tab6:
         st.markdown("""
         <div class="code-block">
         # Framework Multiagente
-        🤖 Dask Orchestrator: Ativo
-        🧠 TensorFlow: Ativo
-        📊 Scikit-learn: Ativo
-        🔍 6 Agentes Especializados
-        
-        # Processamento
-        ⚡ Paralelismo: Dask Distributed
-        🎯 ML: Ensemble + Deep Learning
-        📈 Análise: Tempo Real + Histórica
+        🤖 Orquestrador: Sequencial (7 agentes)
+        📊 Scikit-learn: Isolation Forest, K-Means, PCA
+        📈 yfinance: dados em tempo real (TTL 5min)
+        🎲 Simuladores: MC, Bootstrap, Merton, GARCH
+
+        # Roadmap
+        ⚡ Dask: paralelismo (futuro — > 20 ativos)
+        🧠 LSTM / Autoencoder: em desenvolvimento
+        🔔 Alertas persistentes: em desenvolvimento
         </div>
         """, unsafe_allow_html=True)
         
@@ -2501,18 +2865,18 @@ with tab6:
         
         # Informações do sistema
         if st.session_state.orchestrator:
-            system_status = "✅ OPERACIONAL"
-            dask_status = "✅ ATIVO" if st.session_state.orchestrator.use_dask else "❌ INATIVO"
-            tf_status = "✅ ATIVO" if st.session_state.orchestrator.use_tensorflow else "❌ INATIVO"
+            system_status  = "✅ OPERACIONAL"
+            exec_mode      = "Dask Paralelo" if st.session_state.orchestrator.use_dask else "Sequencial"
+            exec_icon      = "✅" if st.session_state.orchestrator.use_dask else "⚡"
         else:
-            system_status = "❌ OFFLINE"
-            dask_status = "❌ OFFLINE"
-            tf_status = "❌ OFFLINE"
-        
+            system_status  = "❌ OFFLINE"
+            exec_mode      = "—"
+            exec_icon      = ""
+
         st.metric("Sistema Multiagente", system_status)
-        st.metric("Framework Dask", dask_status)
-        st.metric("TensorFlow", tf_status)
-        st.metric("Agentes Ativos", "6/6")
+        st.metric("Modo de execução", f"{exec_icon} {exec_mode}")
+        st.metric("Agentes Ativos", "7/7")
+        st.caption("Dask entra automaticamente quando instalado e > 20 ativos em análise.")
         
         st.subheader("🔍 Diagnóstico")
         if st.button("🩺 Executar Diagnóstico", use_container_width=True, key="run_diagnostic"):
@@ -2538,9 +2902,9 @@ st.markdown(
     """
     <div style='text-align: center; color: #888; font-family: "EB Garamond", serif;'>
     <b>🤖 Quantum Risk Analytics - Sistema Multiagente</b> | 
-    Desenvolvido com Python + Dask + TensorFlow | 
-    Dados: Banco Central do Brasil | 
-    🚀 6 Agentes Especializados em Operação
+    Desenvolvido com Python + yfinance + Scikit-learn |
+    Dados: Yahoo Finance + Banco Central do Brasil |
+    🚀 7 Agentes Especializados em Operação
     </div>
     """, 
     unsafe_allow_html=True
