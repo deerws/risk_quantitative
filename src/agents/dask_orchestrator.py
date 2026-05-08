@@ -937,46 +937,254 @@ class AgentAlert(AgentBase):
         
         return sorted_alerts[:15]
 
-# AgentLSTM e outros permanecem como placeholders
 class AgentLSTM(AgentBase):
-    def __init__(self):
+    """Previsão temporal via MLP com janela deslizante (proxy LSTM sem TF).
+    Aprende padrões sequenciais nos retornos e projeta os próximos `horizon` dias."""
+
+    def __init__(self, window: int = 20, horizon: int = 5):
         super().__init__("AgentLSTM")
-    
-    def process_data(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        self.window   = window
+        self.horizon  = horizon
+        self.lstm_results: Dict[str, Any] = {}
+
+    def _make_sequences(self, series: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        X, y = [], []
+        for i in range(len(series) - self.window):
+            X.append(series[i : i + self.window])
+            y.append(series[i + self.window])
+        return np.array(X), np.array(y)
+
+    def _fit_predict_asset(self, ret: pd.Series) -> Dict[str, Any]:
+        from sklearn.neural_network import MLPRegressor
+
+        r = ret.dropna().values
+        if len(r) < self.window + 30:
+            return {}
+
+        scaler = StandardScaler()
+        r_sc   = scaler.fit_transform(r.reshape(-1, 1)).flatten()
+
+        X, y   = self._make_sequences(r_sc)
+        split  = int(len(X) * 0.8)
+        X_tr, X_te = X[:split], X[split:]
+        y_tr, y_te = y[:split], y[split:]
+
+        model = MLPRegressor(
+            hidden_layer_sizes=(64, 32),
+            activation="tanh",
+            max_iter=300,
+            random_state=42,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=15,
+        )
+        model.fit(X_tr, y_tr)
+
+        y_pred_sc = model.predict(X_te)
+        mae = float(np.mean(np.abs(y_pred_sc - y_te)))
+
+        # Forecast horizon dias para frente
+        window_cur = r_sc[-self.window :].copy()
+        forecast_sc = []
+        for _ in range(self.horizon):
+            nxt = float(model.predict(window_cur.reshape(1, -1))[0])
+            forecast_sc.append(nxt)
+            window_cur = np.append(window_cur[1:], nxt)
+
+        forecast = scaler.inverse_transform(
+            np.array(forecast_sc).reshape(-1, 1)
+        ).flatten().tolist()
+        y_pred = scaler.inverse_transform(
+            y_pred_sc.reshape(-1, 1)
+        ).flatten().tolist()
+        actual = r[-len(y_te) :].tolist()
+
+        trend_avg = float(np.mean(forecast))
+        if trend_avg > 0.002:
+            trend = "alta"
+        elif trend_avg < -0.002:
+            trend = "baixa"
+        else:
+            trend = "lateral"
+
+        return {
+            "forecast":   forecast,
+            "trend":      trend,
+            "trend_avg":  trend_avg,
+            "mae":        mae,
+            "actual":     actual,
+            "predicted":  y_pred,
+            "test_size":  len(y_te),
+        }
+
+    def process_data(self, market_data: pd.DataFrame,
+                     portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         alerts = []
         try:
-            # Implementação futura do LSTM
-            alerts.append(self.generate_alert(
-                "LSTM: Análise temporal avançada disponível",
-                "low",
-                {'status': 'LSTM ready for implementation'}
-            ))
+            # Aceita preços (base-100) ou retornos diretamente
+            if market_data.max().max() > 10:
+                returns = market_data.pct_change().dropna()
+            else:
+                returns = market_data.dropna()
+
+            self.lstm_results = {}
+            for asset in returns.columns:
+                res = self._fit_predict_asset(returns[asset])
+                if not res:
+                    continue
+                self.lstm_results[asset] = res
+
+                if res["trend"] == "baixa" and res["trend_avg"] < -0.003:
+                    alerts.append(self.generate_alert(
+                        f"LSTM prevê baixa para {asset}: {res['trend_avg']:.2%}/dia "
+                        f"nos próximos {self.horizon} dias",
+                        "high",
+                        {"asset": asset, "trend": res["trend"], "trend_avg": res["trend_avg"],
+                         "forecast": res["forecast"]},
+                    ))
+                elif res["trend"] == "alta" and res["trend_avg"] > 0.003:
+                    alerts.append(self.generate_alert(
+                        f"LSTM prevê alta para {asset}: {res['trend_avg']:.2%}/dia "
+                        f"nos próximos {self.horizon} dias",
+                        "low",
+                        {"asset": asset, "trend": res["trend"], "trend_avg": res["trend_avg"],
+                         "forecast": res["forecast"]},
+                    ))
+
+            n = len(self.lstm_results)
+            if n == 0:
+                alerts.append(self.generate_alert(
+                    "LSTM: dados insuficientes (mínimo 50 dias por ativo)", "medium", {}
+                ))
+            else:
+                alerts.append(self.generate_alert(
+                    f"LSTM: {n} ativo(s) analisados — horizonte {self.horizon} dias",
+                    "low",
+                    {"assets_analyzed": list(self.lstm_results.keys())},
+                ))
         except Exception as e:
             alerts.append(self.generate_alert(
-                f"Erro no AgentLSTM: {str(e)}",
-                "critical",
-                {'error': str(e)}
+                f"Erro no AgentLSTM: {str(e)}", "critical", {"error": str(e)}
             ))
         return alerts
 
+
 class AgentAutoencoder(AgentBase):
+    """Detecção de anomalias via Autoencoder MLP com gargalo (bottleneck).
+    Treina para reconstruir retornos normais; alto erro de reconstrução = anomalia."""
+
     def __init__(self):
         super().__init__("AgentAutoencoder")
-    
-    def process_data(self, market_data: pd.DataFrame, portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        self.autoencoder_results: Dict[str, Any] = {}
+
+    def process_data(self, market_data: pd.DataFrame,
+                     portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        from sklearn.neural_network import MLPRegressor
+
         alerts = []
         try:
-            # Implementação futura do Autoencoder
+            if market_data.max().max() > 10:
+                returns = market_data.pct_change().dropna()
+            else:
+                returns = market_data.dropna()
+
+            returns = returns.dropna()
+            n_samples, n_assets = returns.shape
+
+            if n_samples < 30:
+                alerts.append(self.generate_alert(
+                    "Autoencoder: mínimo 30 observações necessárias", "medium", {}
+                ))
+                return alerts
+
+            if n_assets < 2:
+                alerts.append(self.generate_alert(
+                    "Autoencoder: mínimo 2 ativos para análise multivariada", "medium", {}
+                ))
+                return alerts
+
+            # Escalar
+            scaler  = StandardScaler()
+            X       = scaler.fit_transform(returns.values)
+
+            split   = int(n_samples * 0.8)
+            X_train = X[:split]
+
+            # Bottleneck = max(2, n_assets//2)
+            bottleneck = max(2, n_assets // 2)
+
+            model = MLPRegressor(
+                hidden_layer_sizes=(bottleneck,),
+                activation="tanh",
+                max_iter=500,
+                random_state=42,
+                early_stopping=True,
+                validation_fraction=0.1,
+            )
+            model.fit(X_train, X_train)   # target = input → aprende compressão
+
+            X_recon = model.predict(X)
+            errors  = np.mean((X - X_recon) ** 2, axis=1)   # MSE por passo de tempo
+
+            train_err  = errors[:split]
+            threshold  = float(np.mean(train_err) + 2.5 * np.std(train_err))
+            is_anomaly = errors > threshold
+
+            # Contribuição por ativo (MSE individual)
+            errors_by_asset = {
+                col: float(np.mean((X[:, i] - X_recon[:, i]) ** 2))
+                for i, col in enumerate(returns.columns)
+            }
+            mean_asset_err = np.mean(list(errors_by_asset.values()))
+            high_err_assets = [
+                a for a, e in errors_by_asset.items() if e > 2 * mean_asset_err
+            ]
+
+            recent_anomalies = int(is_anomaly[-5:].sum())
+            n_anomalies      = int(is_anomaly.sum())
+
+            self.autoencoder_results = {
+                "errors":          errors.tolist(),
+                "dates":           [str(d) for d in returns.index],
+                "threshold":       threshold,
+                "is_anomaly":      is_anomaly.tolist(),
+                "n_anomalies":     n_anomalies,
+                "recent_anomalies": recent_anomalies,
+                "errors_by_asset": errors_by_asset,
+                "contamination":   float(n_anomalies / n_samples),
+                "assets":          returns.columns.tolist(),
+            }
+
+            if recent_anomalies >= 3:
+                alerts.append(self.generate_alert(
+                    f"Autoencoder: {recent_anomalies} anomalia(s) nos últimos 5 dias — padrão incomum",
+                    "high",
+                    self.autoencoder_results,
+                ))
+            elif recent_anomalies > 0:
+                alerts.append(self.generate_alert(
+                    f"Autoencoder: {recent_anomalies} anomalia(s) recente(s) detectada(s)",
+                    "medium",
+                    self.autoencoder_results,
+                ))
+
+            if high_err_assets:
+                alerts.append(self.generate_alert(
+                    f"Autoencoder: padrão atípico em {', '.join(high_err_assets)}",
+                    "medium",
+                    {"assets": high_err_assets, "errors": errors_by_asset},
+                ))
+
             alerts.append(self.generate_alert(
-                "Autoencoder: Detecção de anomalias avançada disponível", 
+                f"Autoencoder: {n_anomalies}/{n_samples} anomalia(s) — "
+                f"taxa {n_anomalies/n_samples:.1%} | bottleneck={bottleneck}d",
                 "low",
-                {'status': 'Autoencoder ready for implementation'}
+                self.autoencoder_results,
             ))
+
         except Exception as e:
             alerts.append(self.generate_alert(
-                f"Erro no AgentAutoencoder: {str(e)}",
-                "critical",
-                {'error': str(e)}
+                f"Erro no AgentAutoencoder: {str(e)}", "critical", {"error": str(e)}
             ))
         return alerts
 

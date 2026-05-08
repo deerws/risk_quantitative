@@ -2483,24 +2483,188 @@ with tab2:
     
     # Exibir resultados se disponíveis
     if hasattr(st.session_state, 'last_agent_report'):
-        # Abas para diferentes visualizações de alertas
-        tab_alertas, tab_analytics = st.tabs(["🚨 Alertas Detalhados", "📊 Analytics"])
-        
+        tab_alertas, tab_analytics, tab_lstm, tab_ae = st.tabs([
+            "🚨 Alertas", "📊 Analytics", "🧠 LSTM", "🔬 Autoencoder"
+        ])
+
         with tab_alertas:
             display_all_alerts_with_filters(st.session_state.last_agent_report)
-        
+
         with tab_analytics:
             if hasattr(st.session_state, 'last_agent_alerts'):
                 display_agent_analytics(st.session_state.last_agent_alerts)
+
+        # ── LSTM ─────────────────────────────────────────────────────────────
+        with tab_lstm:
+            st.markdown("### 🧠 LSTM — Previsão de Tendência (MLP Temporal)")
+            st.caption(
+                "Rede neural treinada com janela deslizante de 20 dias. "
+                "Prevê retornos dos próximos 5 dias por ativo."
+            )
+            _lstm_res = st.session_state.orchestrator.agent_lstm.lstm_results \
+                        if st.session_state.orchestrator else {}
+
+            if not _lstm_res:
+                st.info("Execute a análise multiagente para ver as previsões LSTM.")
+            else:
+                _trend_icons = {"alta": "📈", "baixa": "📉", "lateral": "➡️"}
+                _trend_colors= {"alta": "#2ecc71", "baixa": "#e74c3c", "lateral": "#f39c12"}
+
+                # Cards de tendência por ativo
+                _asset_list = list(_lstm_res.keys())
+                _cols = st.columns(min(len(_asset_list), 4))
+                for _i, _asset in enumerate(_asset_list):
+                    _r = _lstm_res[_asset]
+                    with _cols[_i % min(len(_asset_list), 4)]:
+                        _icon  = _trend_icons.get(_r["trend"], "")
+                        _color = _trend_colors.get(_r["trend"], "#fff")
+                        st.markdown(
+                            f'<div style="border:2px solid {_color};border-radius:8px;'
+                            f'padding:10px;text-align:center;margin:4px 0">'
+                            f'<b>{_asset}</b><br/>'
+                            f'<span style="font-size:1.4rem">{_icon}</span><br/>'
+                            f'<b style="color:{_color}">{_r["trend"].upper()}</b><br/>'
+                            f'<small>{_r["trend_avg"]:+.3%}/dia</small>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                st.markdown("---")
+
+                # Gráfico: Real vs Previsto (período de teste)
+                _sel = st.selectbox("Ativo para detalhar:", _asset_list, key="lstm_asset_sel")
+                _r   = _lstm_res[_sel]
+
+                _fig_lstm = go.Figure()
+                _x_test = list(range(len(_r["actual"])))
+                _fig_lstm.add_trace(go.Scatter(
+                    x=_x_test, y=_r["actual"],
+                    name="Real", line=dict(color="#00d4aa", width=2)
+                ))
+                _fig_lstm.add_trace(go.Scatter(
+                    x=_x_test, y=_r["predicted"],
+                    name="Previsto (teste)", line=dict(color="#f39c12", width=2, dash="dash")
+                ))
+
+                # Forecast: continua após o último ponto de teste
+                _fc_x = list(range(len(_r["actual"]), len(_r["actual"]) + len(_r["forecast"])))
+                _fig_lstm.add_trace(go.Scatter(
+                    x=_fc_x, y=_r["forecast"],
+                    name=f"Previsão ({len(_r['forecast'])} dias)",
+                    line=dict(color="#9b59b6", width=2, dash="dot"),
+                    mode="lines+markers",
+                ))
+                _fig_lstm.add_vrect(
+                    x0=len(_r["actual"]) - 0.5, x1=len(_r["actual"]) + len(_r["forecast"]) - 0.5,
+                    fillcolor="rgba(155,89,182,0.08)", line_width=0,
+                    annotation_text="Previsão", annotation_position="top left",
+                )
+                _fig_lstm.update_layout(
+                    title=f"LSTM — {_sel}: Real vs Previsto vs Forecast",
+                    height=400,
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#f0f2f6"),
+                    xaxis=dict(title="Dias (período de teste)", gridcolor="#333"),
+                    yaxis=dict(title="Retorno diário", tickformat=".2%", gridcolor="#333"),
+                    legend=dict(bgcolor="rgba(0,0,0,0)"),
+                )
+                st.plotly_chart(_fig_lstm, use_container_width=True)
+                st.caption(f"MAE no conjunto de teste: **{_r['mae']:.4f}** ({_r['test_size']} dias)")
+
+        # ── Autoencoder ───────────────────────────────────────────────────────
+        with tab_ae:
+            st.markdown("### 🔬 Autoencoder — Detecção de Anomalias")
+            st.caption(
+                "MLP com camada bottleneck treinada para reconstruir retornos normais. "
+                "Alto erro de reconstrução = padrão anômalo."
+            )
+            _ae_res = st.session_state.orchestrator.agent_autoencoder.autoencoder_results \
+                      if st.session_state.orchestrator else {}
+
+            if not _ae_res:
+                st.info("Execute a análise multiagente para ver os resultados do Autoencoder.")
+            else:
+                # Métricas resumidas
+                _c1, _c2, _c3, _c4 = st.columns(4)
+                with _c1:
+                    st.metric("Anomalias detectadas", _ae_res["n_anomalies"])
+                with _c2:
+                    st.metric("Últimos 5 dias", _ae_res["recent_anomalies"],
+                              delta="ATENÇÃO" if _ae_res["recent_anomalies"] > 0 else "Normal",
+                              delta_color="inverse" if _ae_res["recent_anomalies"] > 0 else "off")
+                with _c3:
+                    st.metric("Taxa de anomalia", f"{_ae_res['contamination']:.1%}")
+                with _c4:
+                    st.metric("Threshold MSE", f"{_ae_res['threshold']:.6f}")
+
+                # Série de erro de reconstrução ao longo do tempo
+                _errors  = np.array(_ae_res["errors"])
+                _dates   = _ae_res["dates"]
+                _is_anom = np.array(_ae_res["is_anomaly"])
+
+                _fig_ae = go.Figure()
+                _fig_ae.add_trace(go.Scatter(
+                    x=_dates, y=_errors,
+                    name="Erro de reconstrução (MSE)",
+                    line=dict(color="#00d4aa", width=1.5),
+                    fill="tozeroy", fillcolor="rgba(0,212,170,0.1)",
+                ))
+                _fig_ae.add_hline(
+                    y=_ae_res["threshold"],
+                    line=dict(color="#e74c3c", dash="dash", width=1.5),
+                    annotation_text="Threshold",
+                )
+                # Marcar anomalias
+                _anom_dates  = [_dates[i] for i, a in enumerate(_is_anom) if a]
+                _anom_errors = [_errors[i] for i, a in enumerate(_is_anom) if a]
+                if _anom_dates:
+                    _fig_ae.add_trace(go.Scatter(
+                        x=_anom_dates, y=_anom_errors,
+                        mode="markers", name="Anomalia",
+                        marker=dict(color="#e74c3c", size=8, symbol="x"),
+                    ))
+                _fig_ae.update_layout(
+                    title="Erro de Reconstrução — Autoencoder",
+                    height=380,
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#f0f2f6"),
+                    xaxis=dict(gridcolor="#333"),
+                    yaxis=dict(gridcolor="#333", title="MSE"),
+                    legend=dict(bgcolor="rgba(0,0,0,0)"),
+                )
+                st.plotly_chart(_fig_ae, use_container_width=True)
+
+                # Contribuição por ativo
+                st.markdown("#### Contribuição por Ativo")
+                _err_assets = _ae_res["errors_by_asset"]
+                _fig_bar = go.Figure(go.Bar(
+                    x=list(_err_assets.keys()),
+                    y=list(_err_assets.values()),
+                    marker_color=[
+                        "#e74c3c" if e > 2 * np.mean(list(_err_assets.values())) else "#00d4aa"
+                        for e in _err_assets.values()
+                    ],
+                ))
+                _fig_bar.update_layout(
+                    title="Erro médio de reconstrução por ativo",
+                    height=280,
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#f0f2f6"),
+                    yaxis=dict(gridcolor="#333", title="MSE médio"),
+                    xaxis=dict(gridcolor="#333"),
+                )
+                st.plotly_chart(_fig_bar, use_container_width=True)
+                st.caption("Barras vermelhas = ativos com padrão de retorno mais atípico (MSE > 2× média).")
     else:
         st.info("""
         **👆 Execute a análise multiagente para ver os resultados**
-        
+
         O sistema irá analisar:
         - Volatilidade e correlações em tempo real
-        - Agrupamentos de ativos por similaridade  
+        - Agrupamentos de ativos por similaridade
         - Anomalias e padrões usando machine learning
-        - Previsões com redes neurais LSTM
+        - Previsões com rede neural MLP temporal (proxy LSTM)
+        - Autoencoder para detecção de anomalias nos retornos
         - Alertas prioritários inteligentes
         """)
 
