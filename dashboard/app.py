@@ -1431,6 +1431,15 @@ if 'orchestrator' not in st.session_state:
     with st.spinner("🚀 Inicializando Sistema Multiagente..."):
         st.session_state.orchestrator = initialize_multiagent_system()
 
+# Carregar configuração de alertas
+from src.alerts.alert_config import load_config as _load_alert_cfg, save_config as _save_alert_cfg, \
+    evaluate_alerts as _evaluate_alerts, alert_summary as _alert_summary
+
+if 'alert_config' not in st.session_state:
+    st.session_state.alert_config = _load_alert_cfg()
+if 'active_alerts' not in st.session_state:
+    st.session_state.active_alerts = []
+
 # =============================================
 # FUNÇÕES AUXILIARES
 # =============================================
@@ -2154,6 +2163,22 @@ prices_filtered   = prices[selected_assets]
 # Retorno ponderado do portfólio (pesos iguais)
 portfolio_returns = returns_filtered.mean(axis=1)
 
+# --- Avaliar alertas contra configuração do usuário ---
+st.session_state.active_alerts = _evaluate_alerts(returns_filtered, st.session_state.alert_config)
+
+# Badge de alertas na sidebar
+_summary = _alert_summary(st.session_state.active_alerts)
+_total   = sum(_summary.values())
+if _total > 0:
+    _color = "#e74c3c" if (_summary["critical"] + _summary["high"]) > 0 else "#f39c12"
+    st.sidebar.markdown(
+        f'<div style="background:{_color};color:white;padding:6px 10px;border-radius:6px;'
+        f'text-align:center;font-weight:bold;margin-bottom:8px;">'
+        f'🔔 {_total} alerta{"s" if _total > 1 else ""} ativo{"s" if _total > 1 else ""}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
 # --- Benchmarks e Macro (somente no modo Análise de Risco) ---
 _period_days = {"1M": 31, "3M": 92, "6M": 183, "1A": 365,
                 "2A": 730, "5A": 1825, "Personalizado": 365}
@@ -2294,6 +2319,32 @@ with tab1:
         with col4:
             var_95 = np.percentile(portfolio_returns, (1 - confidence_level) * 100)
             st.metric(f"⚠️ VaR {confidence_level:.0%}", f"{var_95:.2%}")
+
+        # ── Painel de alertas ativos ─────────────────────────────────────────
+        _alerts = st.session_state.active_alerts
+        if _alerts:
+            _sev_colors = {"critical": "#c0392b", "high": "#e74c3c",
+                           "medium": "#f39c12", "low": "#27ae60"}
+            _sev_icons  = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
+            _summ = _alert_summary(_alerts)
+            _crit_high = _summ["critical"] + _summ["high"]
+            _label = (f"🚨 {len(_alerts)} alerta{'s' if len(_alerts) > 1 else ''} ativo{'s' if len(_alerts) > 1 else ''}"
+                      f" — {_crit_high} crítico/alto"  if _crit_high else
+                      f"🔔 {len(_alerts)} alerta{'s' if len(_alerts) > 1 else ''} ativo{'s' if len(_alerts) > 1 else ''}")
+            with st.expander(_label, expanded=_crit_high > 0):
+                for _a in _alerts:
+                    _c = _sev_colors.get(_a["severity"], "#999")
+                    st.markdown(
+                        f'<div style="border-left:4px solid {_c};padding:6px 12px;'
+                        f'margin:4px 0;border-radius:0 4px 4px 0;background:rgba(0,0,0,0.15)">'
+                        f'{_sev_icons.get(_a["severity"],"•")} '
+                        f'<strong>{_a["asset"]}</strong> — {_a["message"]}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                st.caption("Configure os limites na aba ⚙️ Configurações → Alertas de Risco.")
+        else:
+            st.success("✅ Nenhum alerta ativo — portfólio dentro dos limites configurados.", icon="✅")
 
         # Status dos agentes
         display_agent_status()
@@ -2819,9 +2870,164 @@ with tab5:
         st.plotly_chart(fig_dd, use_container_width=True)
 
 with tab6:
-    # Configurações Técnicas
+    # ── Configuração de Alertas de Risco ────────────────────────────────────
+    st.markdown('<div class="section-header">🔔 Alertas de Risco — Configuração</div>',
+                unsafe_allow_html=True)
+
+    _cfg = st.session_state.alert_config
+    _p   = _cfg.get("portfolio", {})
+
+    st.markdown("#### Limites do Portfólio")
+    st.caption("Alertas são avaliados em tempo real toda vez que os dados são carregados ou atualizados.")
+
+    _c1, _c2 = st.columns(2)
+
+    with _c1:
+        new_var = st.slider(
+            "VaR 95% diário máximo (%)",
+            min_value=1.0, max_value=20.0,
+            value=float(_p.get("var_threshold", 0.05)) * 100,
+            step=0.5,
+            help="Alerta quando o VaR 95% diário do portfólio superar este valor.",
+            key="alert_var_slider"
+        ) / 100
+
+        new_vol = st.slider(
+            "Volatilidade anual máxima (%)",
+            min_value=5.0, max_value=100.0,
+            value=float(_p.get("volatility_threshold", 0.30)) * 100,
+            step=1.0,
+            help="Alerta quando a volatilidade anualizada do portfólio superar este valor.",
+            key="alert_vol_slider"
+        ) / 100
+
+    with _c2:
+        new_dd = st.slider(
+            "Drawdown atual máximo (%)",
+            min_value=2.0, max_value=50.0,
+            value=float(_p.get("drawdown_threshold", 0.15)) * 100,
+            step=1.0,
+            help="Alerta quando o drawdown corrente do portfólio superar este valor.",
+            key="alert_dd_slider"
+        ) / 100
+
+        new_corr = st.slider(
+            "Correlação média máxima",
+            min_value=0.30, max_value=1.00,
+            value=float(_p.get("correlation_threshold", 0.80)),
+            step=0.05,
+            help="Acima deste valor, a diversificação é considerada comprometida.",
+            key="alert_corr_slider"
+        )
+
+    # ── Overrides por ativo ──────────────────────────────────────────────────
+    st.markdown("#### Limites por Ativo (opcional)")
+    st.caption("Deixe em branco para usar os limites do portfólio como padrão.")
+
+    _asset_overrides = dict(_cfg.get("assets", {}))
+    _loaded_assets   = returns_filtered.columns.tolist() if not returns_filtered.empty else []
+
+    if _loaded_assets:
+        _sel_asset = st.selectbox("Configurar ativo:", ["— selecione —"] + _loaded_assets,
+                                  key="alert_asset_select")
+        if _sel_asset != "— selecione —":
+            _ao = _asset_overrides.get(_sel_asset, {})
+            _ac1, _ac2 = st.columns(2)
+            with _ac1:
+                _a_var = st.number_input(
+                    f"VaR máximo — {_sel_asset} (%)",
+                    min_value=0.5, max_value=30.0,
+                    value=float(_ao.get("var_threshold", new_var)) * 100,
+                    step=0.5, key="alert_asset_var"
+                ) / 100
+            with _ac2:
+                _a_vol = st.number_input(
+                    f"Volatilidade máxima — {_sel_asset} (%)",
+                    min_value=5.0, max_value=150.0,
+                    value=float(_ao.get("volatility_threshold", new_vol)) * 100,
+                    step=1.0, key="alert_asset_vol"
+                ) / 100
+
+            _col_set, _col_rem = st.columns(2)
+            with _col_set:
+                if st.button(f"💾 Salvar para {_sel_asset}", use_container_width=True,
+                             key="alert_asset_save"):
+                    _asset_overrides[_sel_asset] = {
+                        "var_threshold":        _a_var,
+                        "volatility_threshold": _a_vol,
+                    }
+                    st.success(f"Limite personalizado salvo para {_sel_asset}.")
+            with _col_rem:
+                if st.button(f"🗑️ Remover override de {_sel_asset}", use_container_width=True,
+                             key="alert_asset_remove"):
+                    _asset_overrides.pop(_sel_asset, None)
+                    st.info(f"Override removido — {_sel_asset} usará os limites do portfólio.")
+    else:
+        st.info("Carregue ativos na sidebar para configurar limites individuais.")
+
+    # Overrides ativos
+    if _asset_overrides:
+        with st.expander(f"Overrides ativos ({len(_asset_overrides)} ativo(s))", expanded=False):
+            for _tk, _ov in _asset_overrides.items():
+                st.caption(
+                    f"**{_tk}**: VaR ≤ {_ov.get('var_threshold', new_var):.2%}  |  "
+                    f"Vol ≤ {_ov.get('volatility_threshold', new_vol):.2%}"
+                )
+
+    # ── Salvar / Resetar ────────────────────────────────────────────────────
+    st.markdown("---")
+    _btn1, _btn2 = st.columns(2)
+
+    with _btn1:
+        if st.button("💾 Salvar configuração", type="primary",
+                     use_container_width=True, key="alert_save_btn"):
+            new_cfg = {
+                "portfolio": {
+                    "var_threshold":         new_var,
+                    "volatility_threshold":  new_vol,
+                    "drawdown_threshold":    new_dd,
+                    "correlation_threshold": new_corr,
+                },
+                "assets": _asset_overrides,
+            }
+            _save_alert_cfg(new_cfg)
+            st.session_state.alert_config  = new_cfg
+            st.session_state.active_alerts = _evaluate_alerts(returns_filtered, new_cfg)
+            st.success("✅ Configuração salva em `data/alert_config.json`.")
+
+    with _btn2:
+        if st.button("🔄 Restaurar padrões", use_container_width=True, key="alert_reset_btn"):
+            from src.alerts.alert_config import DEFAULT_CONFIG
+            _save_alert_cfg({"portfolio": dict(DEFAULT_CONFIG["portfolio"]), "assets": {}})
+            st.session_state.alert_config  = _load_alert_cfg()
+            st.session_state.active_alerts = _evaluate_alerts(returns_filtered,
+                                                               st.session_state.alert_config)
+            st.info("Configuração restaurada para os valores padrão.")
+
+    # ── Preview de alertas atuais ────────────────────────────────────────────
+    st.markdown("#### Preview — alertas com a configuração atual")
+    _preview_cfg = {
+        "portfolio": {
+            "var_threshold":         new_var,
+            "volatility_threshold":  new_vol,
+            "drawdown_threshold":    new_dd,
+            "correlation_threshold": new_corr,
+        },
+        "assets": _asset_overrides,
+    }
+    _preview_alerts = _evaluate_alerts(returns_filtered, _preview_cfg)
+    if _preview_alerts:
+        _sev_icons = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
+        for _a in _preview_alerts:
+            st.markdown(f"{_sev_icons.get(_a['severity'], '•')} {_a['message']}")
+    else:
+        st.success("Nenhum alerta seria disparado com estes limites.", icon="✅")
+
+    st.markdown("---")
+
+    # ── Configurações Técnicas (conteúdo original) ───────────────────────────
     st.markdown('<div class="section-header">⚙️ Configurações Técnicas</div>', unsafe_allow_html=True)
-    
+
     col1, col2 = st.columns(2)
     
     with col1:
