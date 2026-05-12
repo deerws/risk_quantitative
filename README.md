@@ -105,9 +105,12 @@ risk_quantitative/
 │   └── processed/                # Parquet / CSV
 ├── scripts/
 │   ├── run_pipeline.py           # Pipeline completo ETL → análise → relatório
-│   └── main.py                   # Coleta yfinance + BCB + análise de risco
+│   ├── main.py                   # Coleta yfinance + BCB + análise de risco
+│   ├── scheduler.py              # Rotinas agendadas (APScheduler, ciente do horário B3)
+│   └── notifier.py               # Alertas por email (SMTP) e Telegram
 ├── .streamlit/
 │   └── config.toml               # Tema escuro
+├── .env.example                  # Template de variáveis de ambiente (commitar este)
 ├── docker-compose.yml
 ├── Dockerfile
 └── requirements.txt
@@ -154,6 +157,62 @@ python scripts/run_pipeline.py   # Pipeline completo
 python scripts/main.py           # Análise rápida
 ```
 
+## Scheduler — Rotinas Automáticas
+
+Rotinas agendadas com [APScheduler](https://apscheduler.readthedocs.io/), cientes do horário do pregão B3 (horário de Brasília).
+
+| Job | Horário | O que faz |
+|-----|---------|-----------|
+| ETL pós-fechamento | 18h30 seg–sex | Coleta preços EOD → `data/processed/prices_eod.parquet` |
+| Verificação de risco | 18h45 seg–sex | Calcula VaR/Drawdown; envia alerta se threshold excedido |
+| Relatório EOD | 19h00 seg–sex | Email com resumo do dia + PDF em anexo (se existir) |
+| Refresh fundamentals | Sex 20h00 | Pré-aquece cache de dados fundamentais via yfinance |
+| Monitor intraday | A cada 15 min | Alerta movimentos > 3% durante 10h–17h30 em dias úteis |
+
+### Execução local
+
+```bash
+source .venv/bin/activate
+python scripts/scheduler.py
+```
+
+### Via Docker (recomendado)
+
+```bash
+docker-compose up -d   # sobe dashboard + scheduler
+```
+
+## Notificações
+
+### Email (Gmail com App Password)
+
+1. Acesse [myaccount.google.com](https://myaccount.google.com) → Segurança → Verificação em duas etapas (ative se necessário)
+2. Ainda em Segurança → **Senhas de app** → crie uma senha para "Quantum Risk"
+3. Preencha no `.env`:
+
+```env
+EMAIL_USER=seu_email@gmail.com
+EMAIL_PASSWORD=xxxx xxxx xxxx xxxx   # 16 chars gerados pelo Google
+EMAIL_TO=seu_email@gmail.com         # destinatário (pode ser o mesmo)
+```
+
+> Use **App Password**, nunca sua senha real. A senha do Google não funciona com SMTP externo quando a verificação em duas etapas está ativa.
+
+### Telegram (opcional)
+
+1. Abra o Telegram e fale com [@BotFather](https://t.me/BotFather): `/newbot`
+2. Copie o token gerado
+3. Envie qualquer mensagem ao seu novo bot, depois acesse:
+   `https://api.telegram.org/bot<TOKEN>/getUpdates` — copie o `chat.id`
+4. Preencha no `.env`:
+
+```env
+TELEGRAM_TOKEN=123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TELEGRAM_CHAT_ID=123456789
+```
+
+Se `TELEGRAM_TOKEN` estiver vazio, o Telegram é silenciosamente ignorado — apenas o email é enviado.
+
 ## Fontes de Dados
 
 | Fonte | Dados | Uso |
@@ -169,8 +228,9 @@ python scripts/main.py           # Análise rápida
 
 ## Tecnologias
 
-- **Python 3.10+**
+- **Python 3.11+**
 - **Streamlit + streamlit-autorefresh** — dashboard com auto-refresh para Day Trader
+- **APScheduler** — agendamento de rotinas ciente de fuso horário (BRT)
 - **Pandas / NumPy / SciPy** — computação numérica
 - **scikit-learn** — clustering, Isolation Forest, Random Forest
 - **Plotly** — visualizações interativas (candlestick, scatter, heatmap, histogram)
@@ -181,6 +241,24 @@ python scripts/main.py           # Análise rápida
 
 ## Variáveis de Ambiente
 
-```env
-PYTHONPATH=/app
+Copie `.env.example` para `.env` e preencha:
+
+```bash
+cp .env.example .env
 ```
+
+| Variável | Descrição | Obrigatória |
+|----------|-----------|-------------|
+| `RISK_FREE_RATE` | Taxa livre de risco (ex: 0.1175 = 11,75%) | Não |
+| `CONFIDENCE_LEVEL` | Nível de confiança VaR (ex: 0.95) | Não |
+| `DEFAULT_INVESTMENT` | Capital inicial padrão | Não |
+| `EMAIL_USER` | Conta Gmail para envio de alertas | Para notificações |
+| `EMAIL_PASSWORD` | App Password de 16 chars (não a senha real) | Para notificações |
+| `EMAIL_TO` | Destinatário dos relatórios | Para notificações |
+| `TELEGRAM_TOKEN` | Token do bot (via @BotFather) | Opcional |
+| `TELEGRAM_CHAT_ID` | Chat ID do destinatário | Opcional |
+| `DEFAULT_TICKERS` | Ativos monitorados pelo scheduler | Não |
+| `VAR_ALERT_THRESHOLD` | VaR diário máximo antes do alerta (ex: 0.05) | Não |
+| `DRAWDOWN_ALERT_THRESHOLD` | Drawdown máximo antes do alerta (ex: 0.15) | Não |
+
+> **Nunca commite o `.env`** — apenas o `.env.example` (com placeholders) deve ir ao repositório. O `.gitignore` já bloqueia o `.env`.
