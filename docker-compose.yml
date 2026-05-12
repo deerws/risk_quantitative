@@ -1,28 +1,33 @@
-version: '3.8'
-
 services:
-  economic-cron:
+  dashboard:
     build: .
-    container_name: projeto-risco-cron
+    container_name: quantum-risk-dashboard
+    ports:
+      - "8501:8501"
     volumes:
       - ./data:/app/data
-      - ./logs:/var/log
+      - ./src:/app/src
+      - ./dashboard:/app/dashboard
+      - ./scripts:/app/scripts
+      - ./.streamlit:/app/.streamlit
+      - ./reports:/app/reports
+    env_file:
+      - .env
     environment:
       - PYTHONPATH=/app
     restart: unless-stopped
 
-  # Mudei para Streamlit (baseado no seu requirements.txt)
-  dashboard:
+  scheduler:
     build: .
-    container_name: projeto-risco-dashboard
-    command: streamlit run dashboard/app.py --server.port=8501 --server.address=0.0.0.0
-    ports:
-      - "8501:8501"  # Porta do Streamlit
+    container_name: quantum-risk-scheduler
+    command: python scripts/scheduler.py
     volumes:
       - ./data:/app/data
-      - ./dashboard:/app/dashboard
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./reports:/app/reports
+    env_file:
+      - .env
     environment:
       - PYTHONPATH=/app
-    depends_on:
-      - economic-cron
     restart: unless-stopped
