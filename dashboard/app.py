@@ -2697,13 +2697,15 @@ with tab2:
         "AgentPeerComparison":  ("🔁 Peer — ranking relativo por setor (z-score)",       ["research"]),
         "AgentMacroSensitivity":("🏛️ Macro — beta a CDI, IPCA, câmbio (rolling OLS)",   ["tesoureiro", "credito"]),
         "AgentScenario":        ("⚡ Cenário — stress SELIC+300bps / IPCA+4% / FX+20%", ["tesoureiro", "credito"]),
+        "AgentCVM":             ("🗂️ CVM — séries contábeis B3 via CVM Dados Abertos",  ["research", "credito"]),
+        "AgentScreener":        ("🏆 Screener — ranking composto (Fund+Créd+Div)",       ["research", "credito"]),
     }
 
     # Perfis de sugestão (não restritivo — apenas pré-marca checkboxes)
     _PROFILES = {
         "Todos":                None,
-        "📊 Research (Equity)": ["AgentFundamental", "AgentDividend", "AgentPeerComparison", "AgentMarket", "AgentLSTM"],
-        "🏦 Crédito":           ["AgentCredit", "AgentScenario", "AgentMacroSensitivity", "AgentMarket", "AgentML"],
+        "📊 Research (Equity)": ["AgentFundamental", "AgentDividend", "AgentPeerComparison", "AgentMarket", "AgentLSTM", "AgentCVM", "AgentScreener"],
+        "🏦 Crédito":           ["AgentCredit", "AgentScenario", "AgentMacroSensitivity", "AgentMarket", "AgentML", "AgentCVM", "AgentScreener"],
         "🏛️ Tesoureiro":        ["AgentMacroSensitivity", "AgentScenario", "AgentSimulation", "AgentMarket"],
         "🔍 Quant / Risco":     ["AgentMarket", "AgentML", "AgentSimulation", "AgentLSTM", "AgentAutoencoder", "AgentClustering"],
     }
@@ -2790,10 +2792,12 @@ with tab2:
     # Exibir resultados se disponíveis
     if hasattr(st.session_state, 'last_agent_report'):
         (tab_alertas, tab_analytics, tab_lstm, tab_ae,
-         tab_fund, tab_credit, tab_div, tab_peer, tab_macro, tab_scenario) = st.tabs([
+         tab_fund, tab_credit, tab_div, tab_peer, tab_macro, tab_scenario,
+         tab_cvm, tab_screener) = st.tabs([
             "🚨 Alertas", "📊 Analytics", "🧠 LSTM", "🔬 Autoencoder",
             "📊 Fundamentals", "🏦 Crédito",
             "💰 Dividendos", "🔁 Peer", "🏛️ Macro", "⚡ Cenários",
+            "🗂️ CVM", "🏆 Screener",
         ])
 
         with tab_alertas:
@@ -3543,6 +3547,154 @@ with tab2:
                     f"stress_test_{datetime.now().strftime('%Y%m%d')}.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="dl_scenario_excel")
+
+        # ── CVM ──────────────────────────────────────────────────────────────
+        with tab_cvm:
+            st.markdown("### 🗂️ CVM Dados Abertos — Séries Contábeis B3")
+            st.caption("Fonte: dados.cvm.gov.br · Cobertura: 100% das empresas de capital aberto (incluindo small/mid caps).")
+            _cvm_res = getattr(getattr(_orch, "agent_cvm", None), "cvm_results", {}) or {}
+
+            if not _cvm_res:
+                st.info("Execute a análise com **AgentCVM** para ver os dados contábeis via CVM.")
+            else:
+                _cvm_rows = []
+                for _tk, _d in _cvm_res.items():
+                    _cvm_rows.append({
+                        "Ticker":           _tk,
+                        "Receita Líq. (R$)":_d.get("receita_liquida"),
+                        "EBITDA (R$)":      _d.get("ebitda"),
+                        "Margem EBITDA":    _d.get("margem_ebitda"),
+                        "Trend Margem":     _d.get("margem_ebitda_trend"),
+                        "CAGR Receita 3a":  _d.get("cagr_receita_3a"),
+                        "Dív. Líq./EBITDA": _d.get("net_debt_ebitda"),
+                        "ICR":              _d.get("interest_coverage"),
+                        "Liq. Corrente":    _d.get("current_ratio"),
+                        "FCF (R$)":         _d.get("fcf"),
+                        "FCF Yield":        _d.get("fcf_yield"),
+                        "ROE":              _d.get("roe"),
+                        "ROA":              _d.get("roa"),
+                    })
+                _cvm_df = pd.DataFrame(_cvm_rows).set_index("Ticker")
+                _pct_cols = ["Margem EBITDA", "Trend Margem", "CAGR Receita 3a", "FCF Yield", "ROE", "ROA"]
+                _fmt = {c: "{:.1%}" for c in _pct_cols if c in _cvm_df.columns}
+                for _c in ["Dív. Líq./EBITDA", "ICR", "Liq. Corrente"]:
+                    if _c in _cvm_df.columns:
+                        _fmt[_c] = "{:.2f}x"
+                for _c in ["Receita Líq. (R$)", "EBITDA (R$)", "FCF (R$)"]:
+                    if _c in _cvm_df.columns:
+                        _fmt[_c] = "R$ {:,.0f}"
+                st.dataframe(_cvm_df.style.format(_fmt, na_rep="—"), use_container_width=True)
+
+                # Gráfico de barras — CAGR Receita por ticker
+                _cvm_chart_rows = [{"Ticker": _tk, "CAGR Receita 3a": _d.get("cagr_receita_3a")}
+                                   for _tk, _d in _cvm_res.items() if _d.get("cagr_receita_3a") is not None]
+                if _cvm_chart_rows:
+                    _fig_cvm = px.bar(pd.DataFrame(_cvm_chart_rows), x="Ticker", y="CAGR Receita 3a",
+                        color="CAGR Receita 3a", color_continuous_scale="RdYlGn",
+                        title="CAGR de Receita 3 Anos (Fonte: CVM)")
+                    _fig_cvm.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5)
+                    _fig_cvm.update_layout(height=380, yaxis=dict(tickformat=".1%"),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        font=dict(color="#f0f2f6"))
+                    st.plotly_chart(_fig_cvm, use_container_width=True)
+                    _dl_chart_btn("⬇️ CAGR Receita (HTML)", _fig_cvm, "cvm_cagr", "dl_cvm_chart")
+
+                # Excel
+                _cvm_buf = BytesIO()
+                with pd.ExcelWriter(_cvm_buf, engine="xlsxwriter") as _cw:
+                    _cvm_df.to_excel(_cw, sheet_name="CVM Métricas")
+                _cvm_buf.seek(0)
+                st.download_button("⬇️ CVM Dados (Excel)", _cvm_buf,
+                    f"cvm_dados_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_cvm_excel")
+
+        # ── Screener ─────────────────────────────────────────────────────────
+        with tab_screener:
+            st.markdown("### 🏆 Screener — Ranking Composto de Ativos")
+            st.caption("Score 0–100 combinando Fundamentals (40%), Crédito (40%) e Dividendos (20%). Requer AgentFundamental + AgentCredit + AgentDividend.")
+            _sc_res = getattr(getattr(_orch, "agent_screener", None), "screener_results", {}) or {}
+
+            if not _sc_res:
+                st.info("Execute a análise com **AgentScreener** (e AgentFundamental, AgentCredit, AgentDividend) para ver o ranking.")
+            else:
+                _sc_list = sorted(_sc_res.values(), key=lambda x: x["composite_score"], reverse=True)
+
+                # Cards top-3
+                _top3 = _sc_list[:3]
+                _rec_color = {"COMPRA": "#2ecc71", "NEUTRO": "#f1c40f", "EVITAR": "#e74c3c"}
+                if _top3:
+                    st.markdown("#### Top 3")
+                    _tcols = st.columns(len(_top3))
+                    for _ti, _ts in enumerate(_top3):
+                        with _tcols[_ti]:
+                            _rc = _rec_color.get(_ts["recommendation"], "#aaa")
+                            st.markdown(
+                                f'<div style="border:2px solid {_rc};border-radius:8px;'
+                                f'padding:12px;text-align:center">'
+                                f'<b style="font-size:1.1rem">{_ts["ticker"]}</b><br/>'
+                                f'<small>{_ts.get("name","")}</small><br/>'
+                                f'<span style="font-size:1.8rem;font-weight:bold;color:{_rc}">'
+                                f'{_ts["composite_score"]:.0f}</span><br/>'
+                                f'<span style="color:{_rc};font-weight:bold">{_ts["recommendation"]}</span>'
+                                f'</div>', unsafe_allow_html=True)
+
+                st.markdown("---")
+
+                # Tabela completa
+                _sc_rows_display = []
+                for _s in _sc_list:
+                    _sc_rows_display.append({
+                        "Ticker":       _s["ticker"],
+                        "Nome":         _s.get("name", ""),
+                        "Setor":        _s.get("sector", "N/D"),
+                        "Score":        _s["composite_score"],
+                        "Recomendação": _s["recommendation"],
+                        "Fund.":        _s["score_components"].get("fundamental"),
+                        "Crédito":      _s["score_components"].get("credit"),
+                        "Dividendo":    _s["score_components"].get("dividend"),
+                        "P/E":          _s.get("pe_ratio"),
+                        "EV/EBITDA":    _s.get("ev_ebitda"),
+                        "Margem EBITDA":_s.get("ebitda_margin"),
+                        "Cresc. Receita":_s.get("revenue_growth_yoy"),
+                        "DY":           _s.get("dividend_yield"),
+                        "Credit Rating":_s.get("credit_rating", "N/D"),
+                    })
+                _sc_df = pd.DataFrame(_sc_rows_display).set_index("Ticker")
+                _sc_fmt = {
+                    "Score": "{:.0f}", "Fund.": "{:.0f}", "Crédito": "{:.0f}", "Dividendo": "{:.0f}",
+                    "P/E": "{:.1f}x", "EV/EBITDA": "{:.1f}x",
+                    "Margem EBITDA": "{:.1%}", "Cresc. Receita": "{:.1%}", "DY": "{:.1%}",
+                }
+                def _color_rec(val):
+                    return f"color: {_rec_color.get(val, '#aaa')};font-weight:bold"
+                st.dataframe(
+                    _sc_df.style.format(_sc_fmt, na_rep="—").applymap(_color_rec, subset=["Recomendação"]),
+                    use_container_width=True)
+
+                # Gráfico de barras por score
+                _fig_sc2 = px.bar(
+                    pd.DataFrame(_sc_rows_display), x="Ticker", y="Score",
+                    color="Recomendação",
+                    color_discrete_map={"COMPRA": "#2ecc71", "NEUTRO": "#f1c40f", "EVITAR": "#e74c3c"},
+                    title="Ranking de Ativos — Score Composto")
+                _fig_sc2.add_hline(y=65, line_dash="dash", line_color="#2ecc71", annotation_text="Compra (65)")
+                _fig_sc2.add_hline(y=45, line_dash="dash", line_color="#e74c3c", annotation_text="Evitar (<45)")
+                _fig_sc2.update_layout(height=400, yaxis=dict(range=[0, 100]),
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#f0f2f6"))
+                st.plotly_chart(_fig_sc2, use_container_width=True)
+                _dl_chart_btn("⬇️ Screener Chart (HTML)", _fig_sc2, "screener_ranking", "dl_screener_chart")
+
+                # Excel
+                _sc_buf2 = BytesIO()
+                with pd.ExcelWriter(_sc_buf2, engine="xlsxwriter") as _sw2:
+                    _sc_df.to_excel(_sw2, sheet_name="Ranking")
+                _sc_buf2.seek(0)
+                st.download_button("⬇️ Screener (Excel)", _sc_buf2,
+                    f"screener_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_screener_excel")
 
     else:
         st.info("""

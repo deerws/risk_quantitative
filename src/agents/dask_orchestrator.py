@@ -1220,16 +1220,31 @@ class AgentFundamental(AgentBase):
         return None
 
     def _fetch(self, ticker: str) -> Optional[Dict]:
+        result: Dict[str, Any] = {
+            "info": {}, "fin": pd.DataFrame(), "bs": pd.DataFrame(), "cf": pd.DataFrame(), "cvm": None
+        }
+        # CVM Dados Abertos — fonte primária para ativos B3
+        if ticker.endswith(".SA"):
+            try:
+                from src.etl.cvm_fundamentals import get_fundamental_summary
+                cvm = get_fundamental_summary(ticker)
+                if cvm:
+                    result["cvm"] = cvm
+            except Exception:
+                pass
+        # yfinance — market data e múltiplos de valuation
         try:
             import yfinance as yf
             t = yf.Ticker(ticker)
             info = t.info or {}
-            fin = pd.DataFrame() if info.get("quoteType") == "CRYPTOCURRENCY" else self._safe(t.financials)
-            bs  = self._safe(t.balance_sheet)
-            cf  = self._safe(t.cashflow)
-            return {"info": info, "fin": fin, "bs": bs, "cf": cf}
+            result["info"] = info
+            if info.get("quoteType") != "CRYPTOCURRENCY":
+                result["fin"] = self._safe(t.financials)
+                result["bs"]  = self._safe(t.balance_sheet)
+                result["cf"]  = self._safe(t.cashflow)
         except Exception:
-            return None
+            pass
+        return result if (result["info"] or result["cvm"]) else None
 
     def _safe(self, obj) -> pd.DataFrame:
         try:
@@ -1238,7 +1253,9 @@ class AgentFundamental(AgentBase):
             return pd.DataFrame()
 
     def _compute(self, ticker: str, data: Dict) -> Dict:
-        info, fin, bs, cf = data["info"], data["fin"], data["bs"], data["cf"]
+        info, fin, bs, cf, cvm = (
+            data["info"], data["fin"], data["bs"], data["cf"], data.get("cvm")
+        )
         g = self._get_row
 
         res: Dict[str, Any] = {
@@ -1246,61 +1263,70 @@ class AgentFundamental(AgentBase):
             "name":     info.get("shortName") or info.get("longName", ticker),
             "sector":   info.get("sector", "N/D"),
             "industry": info.get("industry", "N/D"),
-            # --- direct from info ---
-            "pe_ratio":        info.get("trailingPE") or info.get("forwardPE"),
-            "pb_ratio":        info.get("priceToBook"),
-            "ev_ebitda":       info.get("enterpriseToEbitda"),
-            "market_cap":      info.get("marketCap"),
-            "enterprise_value":info.get("enterpriseValue"),
-            "current_price":   info.get("currentPrice") or info.get("regularMarketPrice"),
-            "dividend_yield":  info.get("dividendYield"),
+            "data_source": "CVM+yfinance" if cvm else "yfinance",
+            # valuation (market data — yfinance é a fonte correta)
+            "pe_ratio":         info.get("trailingPE") or info.get("forwardPE"),
+            "pb_ratio":         info.get("priceToBook"),
+            "ev_ebitda":        info.get("enterpriseToEbitda"),
+            "market_cap":       info.get("marketCap"),
+            "enterprise_value": info.get("enterpriseValue"),
+            "current_price":    info.get("currentPrice") or info.get("regularMarketPrice"),
+            "dividend_yield":   info.get("dividendYield"),
         }
 
-        # --- revenue growth YoY ---
-        rev = g(fin, ["Total Revenue"])
-        if rev is None:
-            rev = g(fin, ["Revenue"])
-        # get 2 periods for growth
-        if fin is not None and not fin.empty:
+        if cvm:
+            # Dados contábeis via CVM — cobertura total B3
+            res["revenue_growth_yoy"] = cvm.get("crescimento_receita_yoy")
+            res["revenue_cagr_3y"]    = cvm.get("cagr_receita_3a")
+            res["ebitda"]             = cvm.get("ebitda")
+            res["ebitda_margin"]      = cvm.get("margem_ebitda")
+            res["ebitda_margin_trend"]= cvm.get("margem_ebitda_trend")
+            res["fcf"]                = cvm.get("fcf")
+            res["net_margin"]         = cvm.get("margem_liquida")
+            res["roe"]                = cvm.get("roe")
+            res["roa"]                = cvm.get("roa")
+        else:
+            # Fallback yfinance para não-B3 ou quando CVM falha
             rev_row = None
-            for idx in fin.index:
-                if "revenue" in str(idx).lower():
-                    vals = fin.loc[idx].dropna().values
-                    if len(vals) >= 2:
-                        rev_row = vals
-                    break
+            if fin is not None and not fin.empty:
+                for idx in fin.index:
+                    if "revenue" in str(idx).lower():
+                        vals = fin.loc[idx].dropna().values
+                        if len(vals) >= 2:
+                            rev_row = vals
+                        break
             if rev_row is not None and rev_row[1] != 0:
                 res["revenue_growth_yoy"] = (rev_row[0] - rev_row[1]) / abs(rev_row[1])
             else:
                 res["revenue_growth_yoy"] = None
-        else:
-            res["revenue_growth_yoy"] = None
+            res["revenue_cagr_3y"] = None
 
-        # --- EBITDA & margin ---
-        ebitda = g(fin, ["EBITDA"])
-        if ebitda is None:
-            ebit = g(fin, ["EBIT"]) or g(fin, ["Operating Income"])
-            da   = g(cf, ["Depreciation"]) or g(fin, ["Reconciled Depreciation"])
-            if ebit is not None and da is not None:
-                ebitda = ebit + abs(da)
-        res["ebitda"] = ebitda
+            ebitda = g(fin, ["EBITDA"])
+            if ebitda is None:
+                ebit = g(fin, ["EBIT"]) or g(fin, ["Operating Income"])
+                da   = g(cf, ["Depreciation"]) or g(fin, ["Reconciled Depreciation"])
+                if ebit is not None and da is not None:
+                    ebitda = ebit + abs(da)
+            res["ebitda"] = ebitda
 
-        revenue = g(fin, ["Total Revenue"]) or g(fin, ["Revenue"])
-        res["ebitda_margin"] = (ebitda / revenue) if (ebitda and revenue and revenue != 0) else None
+            revenue = g(fin, ["Total Revenue"]) or g(fin, ["Revenue"])
+            res["ebitda_margin"] = (ebitda / revenue) if (ebitda and revenue and revenue != 0) else None
+            res["ebitda_margin_trend"] = None
 
-        # --- FCF ---
-        fcf = g(cf, ["Free Cash Flow"])
-        if fcf is None:
-            ocf   = g(cf, ["Operating Cash Flow"]) or g(cf, ["Total Cash From Operating Activities"])
-            capex = g(cf, ["Capital Expenditures"]) or g(cf, ["Capital Expenditure"])
-            if ocf is not None and capex is not None:
-                fcf = ocf - abs(capex)
-        res["fcf"] = fcf
+            fcf = g(cf, ["Free Cash Flow"])
+            if fcf is None:
+                ocf   = g(cf, ["Operating Cash Flow"]) or g(cf, ["Total Cash From Operating Activities"])
+                capex = g(cf, ["Capital Expenditures"]) or g(cf, ["Capital Expenditure"])
+                if ocf is not None and capex is not None:
+                    fcf = ocf - abs(capex)
+            res["fcf"] = fcf
+            res["net_margin"] = None
+            res["roe"] = res["roa"] = None
 
-        # --- DCF simplificado (Gordon Growth Model) ---
-        # WACC estimado: 12% (Brasil), g terminal: 4%
+        # DCF (Gordon Growth Model) — WACC 12% BR, g terminal 4%
         WACC, g_term = 0.12, 0.04
-        mc = res["market_cap"]
+        mc  = res["market_cap"]
+        fcf = res["fcf"]
         if fcf and fcf > 0 and mc and mc > 0:
             dcf_val = fcf * (1 + g_term) / (WACC - g_term)
             res["dcf_value"]  = dcf_val
@@ -1393,19 +1419,54 @@ class AgentCredit(AgentBase):
 
     def _compute_credit(self, ticker: str) -> Optional[Dict]:
         try:
-            import yfinance as yf
-            t    = yf.Ticker(ticker)
-            info = t.info or {}
-            bs   = self._safe(t.balance_sheet)
-            cf   = self._safe(t.cashflow)
-            fin  = self._safe(t.financials)
-            g    = self._get_row
+            info: Dict[str, Any] = {}
+            mc: Optional[float] = None
+
+            # yfinance — market cap e informações de setor
+            try:
+                import yfinance as yf
+                t    = yf.Ticker(ticker)
+                info = t.info or {}
+                mc   = info.get("marketCap")
+            except Exception:
+                pass
 
             res: Dict[str, Any] = {
                 "ticker": ticker,
                 "name":   info.get("shortName", ticker),
                 "sector": info.get("sector", "N/D"),
+                "data_source": "yfinance",
             }
+
+            # CVM — fonte primária para ativos B3
+            if ticker.endswith(".SA"):
+                try:
+                    from src.etl.cvm_fundamentals import get_fundamental_summary
+                    cvm = get_fundamental_summary(ticker)
+                    if cvm:
+                        res["data_source"]     = "CVM+yfinance"
+                        res["net_debt"]        = cvm.get("divida_liquida")
+                        res["net_debt_ebitda"] = cvm.get("net_debt_ebitda")
+                        res["interest_coverage"]= cvm.get("interest_coverage")
+                        res["current_ratio"]   = cvm.get("current_ratio")
+                        res["fcf"]             = cvm.get("fcf")
+                        res["fcf_yield"]       = cvm.get("fcf_yield") if mc else None
+                        # score e rating calculados abaixo com os valores já preenchidos
+                        self._fill_credit_score(res)
+                        return res
+                except Exception:
+                    pass
+
+            # Fallback yfinance (não-B3 ou falha CVM)
+            try:
+                import yfinance as yf
+                t    = yf.Ticker(ticker)
+                bs   = self._safe(t.balance_sheet)
+                cf   = self._safe(t.cashflow)
+                fin  = self._safe(t.financials)
+            except Exception:
+                return res
+            g = self._get_row
 
             # Dívida total e caixa
             total_debt = g(bs, ["Total Debt"]) or (
@@ -1445,7 +1506,6 @@ class AgentCredit(AgentBase):
             # FCF Yield
             ocf   = g(cf, ["Operating Cash Flow"]) or g(cf, ["Total Cash From Operating Activities"])
             capex = g(cf, ["Capital Expenditures"]) or g(cf, ["Capital Expenditure"])
-            mc    = info.get("marketCap")
             if ocf and capex is not None and mc and mc > 0:
                 fcf = ocf - abs(capex)
                 res["fcf"]       = fcf
@@ -1454,43 +1514,46 @@ class AgentCredit(AgentBase):
                 res["fcf"]       = None
                 res["fcf_yield"] = None
 
-            # ── Score proprietário (0–100) ──────────────────────────────────
-            score = 50
-            details: Dict[str, int] = {}
-
-            nd = res.get("net_debt_ebitda")
-            if nd is not None:
-                s = 25 if nd < 1 else 15 if nd < 2 else 5 if nd < 3 else 0 if nd < 4 else -20
-                score += s; details["net_debt_ebitda"] = s
-
-            icr = res.get("interest_coverage")
-            if icr is not None:
-                s = 20 if icr > 5 else 10 if icr > 3 else 0 if icr > 1.5 else -20
-                score += s; details["interest_coverage"] = s
-
-            cr = res.get("current_ratio")
-            if cr is not None:
-                s = 10 if cr > 2 else 5 if cr > 1.5 else 0 if cr > 1 else -15
-                score += s; details["current_ratio"] = s
-
-            fy = res.get("fcf_yield")
-            if fy is not None:
-                s = 10 if fy > 0.08 else 5 if fy > 0.04 else 0 if fy > 0 else -15
-                score += s; details["fcf_yield"] = s
-
-            score = max(0, min(100, score))
-            res["credit_score"]   = score
-            res["score_details"]  = details
-            res["credit_rating"]  = (
-                "BAIXO RISCO"    if score >= 70 else
-                "RISCO MODERADO" if score >= 50 else
-                "RISCO ELEVADO"  if score >= 30 else
-                "ALTO RISCO"
-            )
+            self._fill_credit_score(res)
             return res
 
         except Exception as e:
             return {"ticker": ticker, "error": str(e), "credit_score": None, "credit_rating": "N/D"}
+
+    def _fill_credit_score(self, res: Dict[str, Any]) -> None:
+        """Calcula credit_score e credit_rating in-place a partir dos campos de res."""
+        score = 50
+        details: Dict[str, int] = {}
+
+        nd = res.get("net_debt_ebitda")
+        if nd is not None:
+            s = 25 if nd < 1 else 15 if nd < 2 else 5 if nd < 3 else 0 if nd < 4 else -20
+            score += s; details["net_debt_ebitda"] = s
+
+        icr = res.get("interest_coverage")
+        if icr is not None:
+            s = 20 if icr > 5 else 10 if icr > 3 else 0 if icr > 1.5 else -20
+            score += s; details["interest_coverage"] = s
+
+        cr = res.get("current_ratio")
+        if cr is not None:
+            s = 10 if cr > 2 else 5 if cr > 1.5 else 0 if cr > 1 else -15
+            score += s; details["current_ratio"] = s
+
+        fy = res.get("fcf_yield")
+        if fy is not None:
+            s = 10 if fy > 0.08 else 5 if fy > 0.04 else 0 if fy > 0 else -15
+            score += s; details["fcf_yield"] = s
+
+        score = max(0, min(100, score))
+        res["credit_score"]  = score
+        res["score_details"] = details
+        res["credit_rating"] = (
+            "BAIXO RISCO"    if score >= 70 else
+            "RISCO MODERADO" if score >= 50 else
+            "RISCO ELEVADO"  if score >= 30 else
+            "ALTO RISCO"
+        )
 
     def process_data(self, market_data: pd.DataFrame,
                      portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -1965,6 +2028,213 @@ class AgentScenario(AgentBase):
         return alerts
 
 
+class AgentCVM(AgentBase):
+    """Análise de séries temporais contábeis via CVM Dados Abertos.
+
+    Cobre 100% das empresas de capital aberto B3 (incluindo small/mid caps).
+    Detecta tendências: CAGR de receita, deterioração de margem, alavancagem crescente.
+    Requer ativos com sufixo .SA — ignora silenciosamente os demais.
+    """
+
+    def __init__(self):
+        super().__init__("AgentCVM")
+        self.cvm_results: Dict[str, Any] = {}
+
+    def process_data(self, market_data: pd.DataFrame,
+                     portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        alerts = []
+        self.cvm_results = {}
+
+        b3_tickers = [c for c in market_data.columns if c.endswith(".SA")]
+        if not b3_tickers:
+            alerts.append(self.generate_alert(
+                "AgentCVM: nenhum ativo B3 (.SA) no portfólio — agente ignorado", "low", {}))
+            return alerts
+
+        try:
+            from src.etl.cvm_fundamentals import get_fundamental_summary
+        except ImportError:
+            alerts.append(self.generate_alert(
+                "AgentCVM: módulo cvm_fundamentals não encontrado", "medium", {}))
+            return alerts
+
+        for ticker in b3_tickers:
+            try:
+                summary = get_fundamental_summary(ticker, years=3)
+                if not summary:
+                    continue
+                self.cvm_results[ticker] = summary
+
+                cagr = summary.get("cagr_receita_3a")
+                if cagr is not None and cagr < -0.05:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: CAGR receita 3a = {cagr:.1%} — tendência de queda",
+                        "high", {"ticker": ticker, "cagr_receita_3a": cagr}))
+
+                trend = summary.get("margem_ebitda_trend")
+                if trend is not None and trend < -0.05:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: Margem EBITDA deteriorando {trend:+.1%} nos últimos 3 anos",
+                        "high", {"ticker": ticker, "margem_ebitda_trend": trend}))
+
+                nd_ebitda = summary.get("net_debt_ebitda")
+                if nd_ebitda is not None and nd_ebitda > 3.5:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: Alavancagem elevada — Dív. Líq./EBITDA = {nd_ebitda:.1f}x (CVM)",
+                        "high", {"ticker": ticker, "net_debt_ebitda": nd_ebitda}))
+
+                icr = summary.get("interest_coverage")
+                if icr is not None and icr < 2.0:
+                    alerts.append(self.generate_alert(
+                        f"{ticker}: Cobertura de juros baixa — ICR = {icr:.1f}x (CVM)",
+                        "medium", {"ticker": ticker, "interest_coverage": icr}))
+
+            except Exception as e:
+                alerts.append(self.generate_alert(
+                    f"AgentCVM: erro em {ticker}: {e}", "low",
+                    {"ticker": ticker, "error": str(e)}))
+
+        n = len(self.cvm_results)
+        alerts.append(self.generate_alert(
+            f"AgentCVM: {n} ativo(s) B3 analisado(s) via CVM Dados Abertos" if n else
+            "AgentCVM: nenhum dado CVM disponível para os ativos do portfólio",
+            "low", {"tickers": list(self.cvm_results.keys())}))
+        return alerts
+
+
+class AgentScreener(AgentBase):
+    """Ranking composto de ativos: fundamental + crédito + dividendos.
+
+    Combina resultados de AgentFundamental, AgentCredit e AgentDividend em um
+    score único (0–100) e gera recomendação COMPRA / NEUTRO / EVITAR.
+
+    Deve ser executado APÓS os três agentes acima — recebe os resultados
+    via portfolio_config['fundamental_results'], ['credit_results'] e ['dividend_results'].
+    """
+
+    def __init__(self):
+        super().__init__("AgentScreener")
+        self.screener_results: Dict[str, Any] = {}
+
+    def process_data(self, market_data: pd.DataFrame,
+                     portfolio_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        alerts = []
+        self.screener_results = {}
+
+        cfg            = portfolio_config or {}
+        fund_results   = cfg.get("fundamental_results", {})
+        credit_results = cfg.get("credit_results", {})
+        div_results    = cfg.get("dividend_results", {})
+
+        all_tickers = set(fund_results) | set(credit_results) | set(div_results)
+        if not all_tickers:
+            alerts.append(self.generate_alert(
+                "AgentScreener: sem dados — execute AgentFundamental, AgentCredit e AgentDividend primeiro",
+                "medium", {}))
+            return alerts
+
+        scores = []
+        for ticker in sorted(all_tickers):
+            fund   = fund_results.get(ticker, {})
+            credit = credit_results.get(ticker, {})
+            div    = div_results.get(ticker, {})
+
+            weighted_score = 0.0
+            total_weight   = 0.0
+            components: Dict[str, float] = {}
+
+            # ── Fundamental (40%) ────────────────────────────────────────────
+            if fund:
+                fs = 50.0
+                pe = fund.get("pe_ratio")
+                ev = fund.get("ev_ebitda")
+                rg = fund.get("revenue_growth_yoy")
+                em = fund.get("ebitda_margin")
+                du = fund.get("dcf_upside")
+
+                if pe  is not None: fs += 15 if pe < 12  else 8 if pe < 20  else 0 if pe < 30  else -10 if pe < 50 else -20
+                if ev  is not None: fs += 15 if ev < 6   else 8 if ev < 10  else 0 if ev < 15  else -10
+                if rg  is not None: fs += 10 if rg > .15 else 5 if rg > .05 else 0 if rg >= 0  else -10
+                if em  is not None: fs += 10 if em > .30 else 5 if em > .20 else 0 if em > .10 else -10
+                if du  is not None: fs += 15 if du > .30 else 8 if du > .10 else 0 if du >= 0  else -10
+
+                fs = max(0.0, min(100.0, fs))
+                components["fundamental"] = round(fs, 1)
+                weighted_score += fs * 0.40
+                total_weight   += 0.40
+
+            # ── Crédito (40%) ────────────────────────────────────────────────
+            cs = credit.get("credit_score")
+            if cs is not None:
+                components["credit"] = float(cs)
+                weighted_score += cs * 0.40
+                total_weight   += 0.40
+
+            # ── Dividendos (20%) ─────────────────────────────────────────────
+            if div:
+                ds = 50.0
+                dy   = div.get("dividend_yield_avg")
+                cagr = div.get("dividend_cagr_5y")
+                cons = div.get("consistency_score")  # 0–1
+
+                if dy   is not None: ds += 20 if dy   > .08 else 10 if dy   > .05 else 5 if dy > .03 else 0
+                if cagr is not None: ds += 15 if cagr > .10 else 8  if cagr > .05 else 0 if cagr >= 0 else -10
+                if cons is not None: ds += cons * 15
+
+                ds = max(0.0, min(100.0, ds))
+                components["dividend"] = round(ds, 1)
+                weighted_score += ds * 0.20
+                total_weight   += 0.20
+
+            if total_weight == 0:
+                continue
+
+            composite = round(weighted_score / total_weight, 1)
+            recommendation = "COMPRA" if composite >= 65 else "NEUTRO" if composite >= 45 else "EVITAR"
+
+            entry = {
+                "ticker":              ticker,
+                "name":                fund.get("name") or credit.get("name", ticker),
+                "sector":              fund.get("sector") or credit.get("sector", "N/D"),
+                "composite_score":     composite,
+                "recommendation":      recommendation,
+                "score_components":    components,
+                "pe_ratio":            fund.get("pe_ratio"),
+                "ev_ebitda":           fund.get("ev_ebitda"),
+                "ebitda_margin":       fund.get("ebitda_margin"),
+                "revenue_growth_yoy":  fund.get("revenue_growth_yoy"),
+                "dcf_upside":          fund.get("dcf_upside"),
+                "credit_score":        cs,
+                "credit_rating":       credit.get("credit_rating", "N/D"),
+                "dividend_yield":      div.get("dividend_yield_avg"),
+                "dividend_cagr_5y":    div.get("dividend_cagr_5y"),
+            }
+            scores.append(entry)
+
+        scores.sort(key=lambda x: x["composite_score"], reverse=True)
+        self.screener_results = {s["ticker"]: s for s in scores}
+
+        top   = [s for s in scores if s["recommendation"] == "COMPRA"]
+        avoid = [s for s in scores if s["recommendation"] == "EVITAR"]
+
+        if top:
+            top_str = ", ".join(f"{s['ticker']} ({s['composite_score']:.0f})" for s in top[:3])
+            alerts.append(self.generate_alert(
+                f"AgentScreener — Top picks: {top_str}",
+                "low", {"top_picks": [s["ticker"] for s in top]}))
+
+        if avoid:
+            av_str = ", ".join(f"{s['ticker']} ({s['composite_score']:.0f})" for s in avoid[:3])
+            alerts.append(self.generate_alert(
+                f"AgentScreener — Evitar: {av_str}",
+                "high", {"avoid_list": [s["ticker"] for s in avoid]}))
+
+        alerts.append(self.generate_alert(
+            f"AgentScreener: {len(scores)} ativo(s) ranqueados",
+            "low", {"total": len(scores), "ranking": [s["ticker"] for s in scores]}))
+        return alerts
+
+
 class DaskMultiAgentOrchestrator:
     """Orquestrador principal usando Dask - CORRIGIDO"""
     
@@ -1987,6 +2257,8 @@ class DaskMultiAgentOrchestrator:
         self.agent_peer        = AgentPeerComparison()
         self.agent_macro       = AgentMacroSensitivity()
         self.agent_scenario    = AgentScenario()
+        self.agent_cvm         = AgentCVM()
+        self.agent_screener    = AgentScreener()
 
         if use_dask:
             try:
@@ -2109,6 +2381,20 @@ class DaskMultiAgentOrchestrator:
             if _enabled("AgentScenario"):
                 print("   🔄 AgentScenario...")
                 alerts_results.append(self.agent_scenario.process_data(market_data, portfolio_config))
+
+            if _enabled("AgentCVM"):
+                print("   🔄 AgentCVM...")
+                alerts_results.append(self.agent_cvm.process_data(market_data, portfolio_config))
+
+            if _enabled("AgentScreener"):
+                print("   🔄 AgentScreener...")
+                screener_cfg = {
+                    **(portfolio_config or {}),
+                    "fundamental_results": self.agent_fundamental.fundamental_results,
+                    "credit_results":      self.agent_credit.credit_results,
+                    "dividend_results":    self.agent_dividend.dividend_results,
+                }
+                alerts_results.append(self.agent_screener.process_data(market_data, screener_cfg))
 
             print(f"   ✅ {len(alerts_results)} agente(s) executados")
             
