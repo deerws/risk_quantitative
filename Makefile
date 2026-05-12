@@ -1,6 +1,33 @@
-.PHONY: build up down logs clean pipeline report
+VENV    := .venv
+PYTHON  := $(VENV)/bin/python
+PIP     := $(VENV)/bin/pip
+STREAM  := $(VENV)/bin/streamlit
 
-# Docker
+.PHONY: install dev pipeline report test clean build up down logs
+
+# ── Ambiente ──────────────────────────────────────────────────────────────────
+install:
+	python3 -m venv $(VENV)
+	$(PIP) install --upgrade pip
+	$(PIP) install -r requirements.txt
+
+# ── Desenvolvimento ───────────────────────────────────────────────────────────
+dev:
+	$(STREAM) run dashboard/app.py
+
+# ── Scripts ───────────────────────────────────────────────────────────────────
+pipeline:
+	$(PYTHON) scripts/run_pipeline.py
+
+report:
+	$(PYTHON) scripts/daily_report.py
+
+# ── Testes ────────────────────────────────────────────────────────────────────
+test:
+	$(PYTHON) scripts/test_multiagent.py
+	$(PYTHON) scripts/test_quant_agents.py
+
+# ── Docker ────────────────────────────────────────────────────────────────────
 build:
 	docker-compose build
 
@@ -13,27 +40,9 @@ down:
 logs:
 	docker-compose logs -f
 
-# Pipeline
-pipeline:
-	python scripts/run_pipeline.py
-
-report:
-	python scripts/daily_report.py
-
-# Desenvolvimento
-dev:
-	streamlit run dashboard/app.py
-
-# Limpeza
+# ── Limpeza ───────────────────────────────────────────────────────────────────
 clean:
 	find . -name "*.pyc" -delete
-	find . -name "__pycache__" -delete
-	rm -rf data/processed/*.parquet
-	rm -rf reports/figures/*.png
-
-# Airflow
-airflow-init:
-	docker-compose up airflow-init
-
-airflow-up:
-	docker-compose up -d airflow
+	find . -name "__pycache__" -type d -exec rm -rf {} +
+	rm -f reports/figures/*.png
+	rm -f data/processed/*.parquet
