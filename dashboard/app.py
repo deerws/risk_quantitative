@@ -2774,8 +2774,7 @@ with tab2:
                         report = st.session_state.orchestrator.generate_report(alerts)
                         st.session_state.last_agent_report = report
                         st.session_state.last_agent_alerts = alerts
-                        st.success(f"✅ {_n_sel} agente(s) concluídos!")
-                        st.rerun()
+                        st.success(f"✅ {_n_sel} agente(s) concluídos! Veja os resultados abaixo.")
                     except Exception as e:
                         st.error(f"❌ Erro na execução: {str(e)}")
             else:
@@ -3081,7 +3080,7 @@ with tab2:
                         if col in df.columns:
                             styled = styled.format(f, subset=[col], na_rep="N/D")
                     if "DCF Upside" in df.columns:
-                        styled = styled.applymap(
+                        styled = styled.map(
                             lambda v: "color: #2ecc71" if isinstance(v, float) and v > 0.10
                             else ("color: #e74c3c" if isinstance(v, float) and v < -0.10 else ""),
                             subset=["DCF Upside"],
@@ -3217,7 +3216,7 @@ with tab2:
                         if col in df.columns:
                             styled = styled.format(f, subset=[col], na_rep="N/D")
                     if "Score (0-100)" in df.columns:
-                        styled = styled.applymap(
+                        styled = styled.map(
                             lambda v: (
                                 "background-color: rgba(46,204,113,0.2)" if isinstance(v, float) and v >= 70
                                 else "background-color: rgba(231,76,60,0.2)" if isinstance(v, float) and v < 40
@@ -3376,7 +3375,7 @@ with tab2:
 
                         styled = _peer_tbl.style.format("{:.2f}", na_rep="N/D")
                         if _z_cols:
-                            styled = styled.applymap(_color_z, subset=_z_cols)
+                            styled = styled.map(_color_z, subset=_z_cols)
                         st.dataframe(styled, use_container_width=True)
 
                         # Radar de z-scores por ativo
@@ -3669,7 +3668,7 @@ with tab2:
                 def _color_rec(val):
                     return f"color: {_rec_color.get(val, '#aaa')};font-weight:bold"
                 st.dataframe(
-                    _sc_df.style.format(_sc_fmt, na_rep="—").applymap(_color_rec, subset=["Recomendação"]),
+                    _sc_df.style.format(_sc_fmt, na_rep="—").map(_color_rec, subset=["Recomendação"]),
                     use_container_width=True)
 
                 # Gráfico de barras por score
