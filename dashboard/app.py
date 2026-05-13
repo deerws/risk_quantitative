@@ -2387,7 +2387,13 @@ else:
 
 # Alertas de tickers inválidos
 if st.session_state.invalid_tickers:
-    st.warning(f"⚠️ Tickers não encontrados: **{', '.join(st.session_state.invalid_tickers)}**")
+    _inv = ", ".join(f"`{t}`" for t in st.session_state.invalid_tickers)
+    st.warning(
+        f"⚠️ Ticker(s) não encontrado(s): {_inv}\n\n"
+        "Possíveis causas: ticker inexistente, erro de digitação ou ativo fora de cobertura do Yahoo Finance. "
+        "Ativos B3 precisam do sufixo `.SA` (ex: `EMBR3.SA` para Embraer, `PETR4.SA` para Petrobras). "
+        "Use a **busca por nome** na barra lateral para encontrar o ticker correto."
+    )
 
 if returns.empty:
     st.info("""
@@ -3373,7 +3379,9 @@ with tab2:
                             if v < -1.5: return "color: #2ecc71"
                             return ""
 
-                        styled = _peer_tbl.style.format("{:.2f}", na_rep="N/D")
+                        _peer_num = _peer_tbl.select_dtypes(include="number").columns.tolist()
+                        _peer_fmt = {c: "{:.2f}" for c in _peer_num}
+                        styled = _peer_tbl.style.format(_peer_fmt, na_rep="—")
                         if _z_cols:
                             styled = styled.map(_color_z, subset=_z_cols)
                         st.dataframe(styled, use_container_width=True)
